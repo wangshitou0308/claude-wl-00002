@@ -166,15 +166,29 @@ def parse_score(xml_bytes: bytes) -> Dict[str, Any]:
 
     for part_idx, parsed in enumerate(parsed_parts[1:], start=1):
         pid = part_list[part_idx]
+        reported_time_conflict = False
+        # 声部内部已因“自始至终无拍号”报过 missing_time_signature 时，
+        # 跨声部对比不再重复报告同一根因
+        part_codes = {i["code"] for i in parsed["issues"]}
+        reported_time_conflict = "missing_time_signature" in part_codes
         for idx, m in enumerate(parsed["measures"]):
             if idx >= len(measures):
                 break
             base_m = base["measures"][idx]
             if m["time_sig"] != base_m["time_sig"]:
-                issues.append(_issue("error", "time_signature_conflict",
-                                     f"两声部在第 {m['number']} 小节拍号不一致："
-                                     f"{base_m['time_sig']} vs {m['time_sig']}",
-                                     pid, m["number"], None))
+                # 该声部全程无拍号时只报一次，避免逐小节级联重复
+                if m["time_sig"] is None and not reported_time_conflict:
+                    reported_time_conflict = True
+                    issues.append(_issue(
+                        "error", "missing_time_signature",
+                        f"声部 {pid} 自第 {m['number']} 小节起缺少拍号声明"
+                        "（后续小节同样缺失，不再逐节重复）。",
+                        pid, m["number"], None))
+                elif m["time_sig"] is not None:
+                    issues.append(_issue("error", "time_signature_conflict",
+                                         f"两声部在第 {m['number']} 小节拍号不一致："
+                                         f"{base_m['time_sig']} vs {m['time_sig']}",
+                                         pid, m["number"], None))
             if m["number"] != base_m["number"]:
                 issues.append(_issue("warning", "measure_number_conflict",
                                      f"两声部第 {idx + 1} 小节编号不一致："
@@ -183,26 +197,13 @@ def parse_score(xml_bytes: bytes) -> Dict[str, Any]:
 
     # 汇总问题与事件，声部角色按谱面顺序
     roles = {part_list[0]: "upper", part_list[1]: "lower"}
+    events: List[Dict[str, Any]] = []
+    divisions_initial = parsed_parts[0].get("divisions_initial")
     for part_idx, parsed in enumerate(parsed_parts):
         pid = part_list[part_idx]
         for iss in parsed["issues"]:
             iss.setdefault("part_id", pid)
             issues.append(iss)
-
-    events: List[Dict[str, Any]] = []
-    divisions_initial = parsed_parts[0].get("divisions_initial")
-    for part_idx, parsed in enumerate(parsed_parts):
-        pid = part_list[part_idx]
-        if parsed.get("divisions_initial") is None:
-            issues.append(_issue("error", "missing_divisions",
-                                 "声部缺少 <divisions> 声明，无法按 divisions 还原时间位置。",
-                                 pid, None, None))
-        elif part_idx == 0:
-            divisions_initial = parsed["divisions_initial"]
-        elif parsed["divisions_initial"] != divisions_initial:
-            # 开头 divisions 不同本身不报错（后续各自换算），仅记录
-            pass
-
         for ev in parsed["events"]:
             ev["part_id"] = pid
             ev["role"] = roles[pid]
@@ -280,6 +281,8 @@ def _parse_part(pid: str, part_el: ET.Element) -> Dict[str, Any]:
     current_key: Optional[Dict[str, Any]] = None
     current_time: Optional[Dict[str, Any]] = None
     order_counter = 0
+    missing_divisions_reported = False
+    missing_time_reported = False
 
     for m_idx, measure in enumerate(_children(part_el, "measure")):
         number_attr = measure.get("number")
@@ -349,9 +352,17 @@ def _parse_part(pid: str, part_el: ET.Element) -> Dict[str, Any]:
                 seen_note_in_measure = True
                 note_index += 1
                 order_counter += 1
+                if divisions is None and not missing_divisions_reported:
+                    missing_divisions_reported = True
+                    issues.append(_issue(
+                        "error", "missing_divisions",
+                        "音符之前没有 <divisions> 声明，无法按 divisions 还原"
+                        "时间位置（后续音符同因，不再重复）。",
+                        pid, number, note_index))
                 ev, advance = _parse_note(el, pid, number, m_idx, note_index,
                                           order_counter, cursor, divisions,
-                                          current_time, current_key, issues)
+                                          current_time, current_key, issues,
+                                          suppress_missing_divisions=missing_divisions_reported)
                 if ev is not None:
                     events.append(ev)
                     if not ev["chord"]:
@@ -383,22 +394,35 @@ def _parse_part(pid: str, part_el: ET.Element) -> Dict[str, Any]:
             expected = current_time["beats"] * 4.0 / current_time["beat_type"]
             if abs(cursor - expected) > 1e-6:
                 issues.append(_issue(
-                    "error" if m_idx > 0 else "error",
+                    "error",
                     "measure_length_mismatch",
                     f"小节时值总和 {_q(cursor)} 个四分音符，与拍号要求的 "
                     f"{_q(expected)} 个不符（可能漏写音符或时值）。",
                     pid, number, None))
-        else:
+        elif not missing_time_reported:
+            missing_time_reported = True
             issues.append(_issue("error", "missing_time_signature",
-                                 f"第 {number} 小节结束时仍无生效拍号，无法校验小节长度。",
+                                 f"第 {number} 小节结束时仍无生效拍号，无法校验小节长度"
+                                 "（后续小节同因，不再重复）。",
                                  pid, number, None))
         measures.append(measure_info)
 
-    # 单声部 voice 一致性：收集到的不同 voice id
-    voice_ids = {e["voice"] for e in events if e["voice"] is not None}
-    if len(voice_ids) > 1:
+    # 单声部 voice 一致性：收集每个 voice id 出现的具体位置
+    voice_locations: Dict[str, List[Dict[str, int]]] = {}
+    for e in events:
+        if e["voice"] is None:
+            continue
+        voice_locations.setdefault(e["voice"], []).append(
+            {"measure": e["measure"], "note_index": e["note_index"]})
+    if len(voice_locations) > 1:
+        detail = "; ".join(
+            f"voice {vid}：" + "、".join(f"第{loc['measure']}小节第{loc['note_index']}个音符"
+                                          for loc in locs[:10])
+            + ("…" if len(locs) > 10 else "")
+            for vid, locs in sorted(voice_locations.items()))
         issues.append(_issue("error", "multiple_voices_in_part",
-                             f"声部内混写了多个 <voice>：{sorted(voice_ids)}；"
+                             f"声部内混写了 {len(voice_locations)} 个 <voice>："
+                             f"{sorted(voice_locations)}。{detail}；"
                              "两声部作业必须每个 <part> 只含一个声部。",
                              pid, None, None))
 
@@ -436,7 +460,9 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
                 note_index: int, order: int, cursor: float,
                 divisions: Optional[int], time_sig: Optional[Dict[str, Any]],
                 key: Optional[Dict[str, Any]],
-                issues: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+                issues: List[Dict[str, Any]],
+                suppress_missing_divisions: bool = False
+                ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """解析单个 <note>。返回 (事件或None, 时间推进或None)。"""
     loc = {"part_id": pid, "measure": number, "note_index": note_index}
 
@@ -515,9 +541,10 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
     dots = len(_children(el, "dot"))
 
     if divisions is None:
-        issues.append(_issue("error", "missing_divisions",
-                             "音符之前没有 <divisions> 声明，无法按 divisions 还原时间位置。",
-                             pid, number, note_index))
+        if not suppress_missing_divisions:
+            issues.append(_issue("error", "missing_divisions",
+                                 "音符之前没有 <divisions> 声明，无法按 divisions 还原时间位置。",
+                                 pid, number, note_index))
         duration_q: Optional[float] = None
         raw_dur = _int(el, "duration")
         if raw_dur is None and not is_chord:
@@ -541,6 +568,10 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
             duration_q = raw_dur / divisions
 
     # ---- 延音 tie / tied ----------------------------------------------
+    # 标准记法：声音连接写在 <tie type="start|stop"/>（note 的直接子元素），
+    # 视觉连线写在 <notations><tied type="start|stop"/></notations>。
+    # 不少制谱软件只输出 <tied>；两者任一出现都视为延音端点，否则
+    # 跨小节同音延音会被误判成两个新起音。
     tie_start = False
     tie_stop = False
     for tie in _children(el, "tie"):
@@ -553,6 +584,20 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
             issues.append(_issue("warning", "unknown_tie_type",
                                  f"<tie type={kind!r}> 无法识别，按忽略处理。",
                                  pid, number, note_index))
+    for notations in _children(el, "notations"):
+        for tied in _children(notations, "tied"):
+            kind = tied.get("type")
+            if kind == "start":
+                tie_start = True
+            elif kind == "stop":
+                tie_stop = True
+            elif kind == "continue":
+                pass
+            else:
+                issues.append(_issue("warning", "unknown_tied_type",
+                                     f"<tied type={kind!r}> 无法识别，按忽略处理。",
+                                     pid, number, note_index))
+    # 兼容少数把 <tied> 直接写在单数 <notation> 里的旧文件
     for notation in _children(el, "notation"):
         for tied in _children(notation, "tied"):
             kind = tied.get("type")

@@ -72,10 +72,10 @@ class TestParser(unittest.TestCase):
 
     def test_divisions_time_positions(self):
         parsed = musicxml_io.parse_score(read_sample("good_exercise.musicxml"))
+        # m8 内：跨小节延来的半音符 C5（拍内偏移 0）与解决音 B4（偏移 2 个四分音符）
         upper_events = [e for e in parsed["events"]
-                        if e["role"] == "upper" and e["measure"] == 7]
+                        if e["role"] == "upper" and e["measure"] == 8]
         starts = [e["start"] for e in upper_events]
-        # m7 内两个二分音符：0 与 2（四分音符单位）
         self.assertEqual(starts, [0.0, 2.0])
 
     def test_ties_detected(self):
@@ -83,9 +83,48 @@ class TestParser(unittest.TestCase):
         ties = [(e["measure"], e["note_index"], e["tie_start"], e["tie_stop"])
                 for e in parsed["events"] if e["role"] == "upper"
                 and (e["tie_start"] or e["tie_stop"])]
-        # m7 两个半音符 start/stop 成对，m8 第一个半音符继续 start
-        self.assertTrue(any(t[0] == 7 and t[2] for t in ties))
-        self.assertTrue(any(t[0] == 8 and t[2] for t in ties))
+        # 跨小节延音：m7 全音符 tie start，m8 第一个半音符 tie stop
+        self.assertIn((7, 1, True, False), ties)
+        self.assertIn((8, 1, False, True), ties)
+
+    def test_cross_measure_tie_merges_attacks(self):
+        """只有 <notations><tied>（无 <tie>）的跨小节延音也必须合并为一个起音。"""
+        xml = b"""<?xml version="1.0"?>
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1"><part-name>A</part-name></score-part>
+    <score-part id="P2"><part-name>B</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1"><attributes><divisions>2</divisions>
+      <key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>8</duration><type>whole</type>
+        <notations><tied type="start"/></notations><voice>1</voice></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>8</duration><type>whole</type>
+        <notations><tied type="stop"/></notations><voice>1</voice></note>
+    </measure>
+  </part>
+  <part id="P2">
+    <measure number="1"><attributes><divisions>2</divisions>
+      <key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>8</duration><type>whole</type><voice>1</voice></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>8</duration><type>whole</type><voice>1</voice></note>
+    </measure>
+  </part>
+</score-partwise>"""
+        parsed = musicxml_io.parse_score(xml)
+        self.assertFalse(parsed["fatal"])
+        line = counterpoint._build_voice_line(parsed["events"], "P1", parsed["measures"])
+        # 跨小节同音高延音：只算一个发声片段、一个起音
+        self.assertEqual(len(line["segments"]), 1)
+        self.assertEqual(len(line["attacks"]), 1)
+        seg = line["segments"][0]
+        self.assertAlmostEqual(seg["start"], 0.0)
+        self.assertAlmostEqual(seg["end"], 8.0)  # 两小节共 8 个四分音符
 
     def test_broken_notation_is_fatal_and_located(self):
         parsed = musicxml_io.parse_score(read_sample("broken_notation.musicxml"))
@@ -182,10 +221,10 @@ class TestAnalysis(unittest.TestCase):
 
     def test_good_sample_no_errors(self):
         result = self.analyze_xml(read_sample("good_exercise.musicxml"))
-        errors = [f for f in result["findings"] if f["severity"] == "error"]
-        self.assertEqual(errors, [f["message"] for f in errors][:0] or
-                         [(f["kind"], f["measure"], f["beat"], f["message"])
-                          for f in errors])
+        # 干净样例不应有任何发现（含 error 与 warning）
+        self.assertEqual(
+            [(f["kind"], f["measure"], f["beat"]) for f in result["findings"]],
+            [])
 
     def test_bad_sample_has_expected_kinds(self):
         result = self.analyze_xml(read_sample("bad_exercise.musicxml"))
@@ -226,7 +265,8 @@ class TestAnalysis(unittest.TestCase):
                         [f["message"] for f in result["findings"]])
 
     def test_voice_crossing(self):
-        xml = make_two_bar_whole(("C5", "C5"), ("C3", "A4"))
+        # m2 低音 A5 高于高音 C5，构成交叉
+        xml = make_two_bar_whole(("C5", "C5"), ("C3", "A5"))
         result = self.analyze_xml(xml)
         self.assertTrue(any(f["kind"] == "voice_crossing" and f["measure"] == 2
                             for f in result["findings"]))
@@ -255,10 +295,12 @@ class TestAnalysis(unittest.TestCase):
         self.assertIn("not_step_down", strong[0]["trace"]["reasons"])
 
     def test_weak_dissonance_passing_tone_ok(self):
-        # 高：C5 D5 E5 F5 四分；低全音符 C3/F3...
-        # beat2: D5-C3 = M9(M2) 不协和，上行级进进入，beat3 E5-C3=M10（M3）同向级进解决
-        xml = make_quarter_case(lower_whole=("C3", "C3"),
-                                upper_q=["C5", "D5", "E5", "F5"])
+        # 高声部两小节级进线条 C5-D5-E5-F5-E5-D5，低声部两小节 C3 全音符：
+        # beat2 的 D5 对 C3 为大二度，级进进入、同向级进解决到 E5(M3)，
+        # 是合法经过音；第二小节保证线条不以不协和悬空结束。
+        xml = make_quarter_case(
+            lower_whole=("C3", "C3"),
+            upper_q=["C5", "D5", "E5", "F5", "E5", "D5", "C5", "C5"])
         result = self.analyze_xml(xml)
         self.assertFalse(any("weak_dissonance" in f["kind"]
                              for f in result["findings"]),
@@ -314,28 +356,30 @@ def make_two_bar_whole(upper, lower):
 
 
 def make_suspension_case(valid=True):
-    """m2 强拍延留：高 C5 从 m1 保持到 m2 强拍，对低 F2 构成 P4。"""
+    """m2 强拍延留：高 C5 从 m1 跨小节保持，对低 G3 构成 P4。
+
+    合法：级进下行到 B4，B4/G3 为大三度（4-3 解决）。
+    非法：下行跳到 G4，G4/G3 为八度（跳进离开，非级进解决）。
+    """
     from counterpoint_api.samples_helper import build_doc
-    resolve = "B4" if valid else "A4"  # A4 对 G2 是 M7（不协和）且非级进
+    resolve = "B4" if valid else "G4"
     upper = [
-        [("C5", "w")],
-        [("C5", "h", {"tie": "start"}), (resolve, "h")],
+        [("C5", "w", {"tie": "start"})],       # m1 准备：C5/F3 = P5 协和
+        [("C5", "h", {"tie": "stop"}), (resolve, "h")],
     ]
-    # m1 低全音符 F2? 准备点需要协和：F2-C5 = P12 协和 ✓
-    # m2: F2 半小节（C5 = P4 延留），随后 G2 半小节
     lower = [
-        [("F2", "w")],
-        [("F2", "h"), ("G2", "h")],
+        [("F3", "w")],
+        [("G3", "w")],                         # 低音 F3→G3；强拍 C5/G3=P4
     ]
-    # 跨小节延音：m1 的 C5 需要 tie start，m2 第一个音 tie stop
-    upper[0] = [("C5", "w", {"tie": "start"})]
-    upper[1] = [("C5", "h", {"tie": "stop"}), (resolve, "h")]
     return build_doc(upper, lower)
 
 
 def make_quarter_case(lower_whole, upper_q):
     from counterpoint_api.samples_helper import build_doc
-    return build_doc([upper_q], [[(lower_whole[0], "w")]])
+    # 上声部四分音符按每小节 4 个拆分；低声部每小节一个全音符
+    upper_measures = [upper_q[i:i + 4] for i in range(0, len(upper_q), 4)]
+    lower_measures = [[(name, "w")] for name in lower_whole[:len(upper_measures)]]
+    return build_doc(upper_measures, lower_measures)
 
 
 class TestStorageAndService(unittest.TestCase):
@@ -344,6 +388,7 @@ class TestStorageAndService(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+        Database.reset_shared_memory()
 
     def test_full_flow_and_comparison(self):
         # 上传两份谱

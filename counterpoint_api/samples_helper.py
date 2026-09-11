@@ -8,8 +8,12 @@ TYPE = {"w": "whole", "h": "half", "q": "quarter", "e": "eighth"}
 
 
 def _note(token):
-    pitch, typ = token[0], token[1]
-    opts = token[2] if len(token) > 2 else {}
+    # 裸字符串 "C5"/"r" 视为四分音符
+    if isinstance(token, str):
+        pitch, typ, opts = token, "q", {}
+    else:
+        pitch, typ = token[0], token[1]
+        opts = token[2] if len(token) > 2 else {}
     duration = DUR[typ]
     if opts.get("dot"):
         duration = int(duration * 1.5)

@@ -283,9 +283,15 @@ def _check_crossing(ctx: Dict[str, Any], rules: Dict[str, Any]) -> List[Dict[str
         return []
     out: List[Dict[str, Any]] = []
     prev_point: Optional[Dict[str, Any]] = None
+    reported_cross_pairs = set()
     for p in ctx["checkpoints"]:
         up_m, lo_m = p["upper"]["pitch"]["midi"], p["lower"]["pitch"]["midi"]
+        pair_key = (id(p["upper"]), id(p["lower"]))
         if rules["voice"]["check_crossing"] and up_m < lo_m:
+            if pair_key in reported_cross_pairs:
+                prev_point = p
+                continue
+            reported_cross_pairs.add(pair_key)
             iv = _interval_at(p)
             out.append(_finding(
                 "voice_crossing", ctx, p["time"],
@@ -422,16 +428,30 @@ def _check_strong_weak_dissonance(ctx: Dict[str, Any],
                                   rules: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     points = ctx["checkpoints"]
+    # 同一对发声片段（如全音符内每个拍点）的不协和只在对应拍位类别
+    # （强/弱）首次出现时评估一次：持续不协和不逐拍重复报告；
+    # 合法延留音持续到解决前的弱位也由此豁免。
+    # 弱位先进入、持续到强拍的不协和是另一类错误，强位仍单独评估。
+    seen_pairs = {"strong": set(), "weak": set()}
     for idx, p in enumerate(points):
         iv = _interval_at(p)
         if rc.is_consonant(iv, rules):
             continue
+        bucket = "strong" if p["strong"] else "weak"
+        pair_key = (id(p["upper"]), id(p["lower"]))
+        if pair_key in seen_pairs[bucket]:
+            continue
+        seen_pairs[bucket].add(pair_key)
         prev_p = points[idx - 1] if idx > 0 else None
         next_p = points[idx + 1] if idx + 1 < len(points) else None
         if p["strong"]:
             finding = _strong_dissonance(ctx, rules, p, iv, prev_p, next_p)
             if finding:
                 out.append(finding)
+            else:
+                # 合法延留音（强拍不协和、有准备、下行级进解决）：
+                # 同一对片段持续到解决前的弱位拍点也不重复报告。
+                seen_pairs["weak"].add(pair_key)
         else:
             out.extend(_weak_dissonance(ctx, rules, p, iv, prev_p, next_p))
     return out

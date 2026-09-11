@@ -52,8 +52,8 @@
     </note>
     <note>
       <pitch>
-        <step>F</step>
-        <octave>5</octave>
+        <step>E</step>
+        <octave>6</octave>
       </pitch>
       <duration>2</duration>
       <type>quarter</type>
@@ -110,7 +110,16 @@
     </note>
     <note>
       <pitch>
-        <step>C</step>
+        <step>B</step>
+        <octave>4</octave>
+      </pitch>
+      <duration>2</duration>
+      <type>quarter</type>
+      <voice>1</voice>
+    </note>
+    <note>
+      <pitch>
+        <step>E</step>
         <octave>5</octave>
       </pitch>
       <duration>2</duration>
@@ -120,15 +129,6 @@
     <note>
       <pitch>
         <step>D</step>
-        <octave>5</octave>
-      </pitch>
-      <duration>2</duration>
-      <type>quarter</type>
-      <voice>1</voice>
-    </note>
-    <note>
-      <pitch>
-        <step>C</step>
         <octave>5</octave>
       </pitch>
       <duration>2</duration>
@@ -186,7 +186,7 @@
     </note>
     <note>
       <pitch>
-        <step>G</step>
+        <step>A</step>
         <octave>5</octave>
       </pitch>
       <duration>2</duration>
@@ -195,7 +195,7 @@
     </note>
     <note>
       <pitch>
-        <step>D</step>
+        <step>E</step>
         <octave>6</octave>
       </pitch>
       <duration>2</duration>
@@ -204,7 +204,7 @@
     </note>
     <note>
       <pitch>
-        <step>C</step>
+        <step>E</step>
         <octave>6</octave>
       </pitch>
       <duration>2</duration>
@@ -316,17 +316,8 @@
     </note>
     <note>
       <pitch>
-        <step>A</step>
-        <octave>2</octave>
-      </pitch>
-      <duration>2</duration>
-      <type>quarter</type>
-      <voice>1</voice>
-    </note>
-    <note>
-      <pitch>
         <step>G</step>
-        <octave>2</octave>
+        <octave>3</octave>
       </pitch>
       <duration>2</duration>
       <type>quarter</type>
@@ -334,8 +325,17 @@
     </note>
     <note>
       <pitch>
-        <step>A</step>
-        <octave>2</octave>
+        <step>E</step>
+        <octave>4</octave>
+      </pitch>
+      <duration>2</duration>
+      <type>quarter</type>
+      <voice>1</voice>
+    </note>
+    <note>
+      <pitch>
+        <step>B</step>
+        <octave>3</octave>
       </pitch>
       <duration>2</duration>
       <type>quarter</type>

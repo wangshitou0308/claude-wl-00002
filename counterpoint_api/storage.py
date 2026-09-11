@@ -96,19 +96,38 @@ def utc_now() -> str:
 
 
 class Database:
-    """SQLite 连接封装，按需传文件路径，``:memory:`` 用于测试。"""
+    """SQLite 连接封装，按需传文件路径，``:memory:`` 用于测试。
+
+    文件库每实例一个连接（服务端每请求新建）；内存库默认使用进程内
+    共享的单一连接（带 ``check_same_thread=False``），否则不同连接会
+    看到彼此独立的空内存库。
+    """
+
+    _memory_shared: Optional["Database"] = None
 
     def __init__(self, path: str = "counterpoint.db"):
         self.path = path
-        if path != ":memory:":
+        if path == ":memory:":
+            if Database._memory_shared is not None:
+                self._shared = True
+                self.conn = Database._memory_shared.conn
+                return
+            self._shared = False
+            self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+            Database._memory_shared = self
+        else:
+            self._shared = False
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+            self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
     def close(self) -> None:
+        # 共享内存连接由进程持有，单次 close 不真正关闭
+        if self._shared or self.path == ":memory:":
+            return
         self.conn.close()
 
     def __enter__(self) -> "Database":
@@ -116,6 +135,23 @@ class Database:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    @classmethod
+    def reset_shared_memory(cls) -> None:
+        """丢弃共享内存库（测试隔离用）。"""
+        if cls._memory_shared is not None:
+            try:
+                cls._memory_shared.conn.close()
+            except sqlite3.Error:
+                pass
+            cls._memory_shared = None
+
+    def wipe(self) -> None:
+        """清空全部业务表（测试隔离用）。"""
+        for table in ("verdicts", "findings", "analyses", "comparisons",
+                      "rule_sets", "scores"):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # 原谱
