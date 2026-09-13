@@ -215,6 +215,36 @@ def bad_exercise_revised():
     return document("示例2修订版-部分问题已修复", upper, lower)
 
 
+def bad_exercise_revised2():
+    """第二轮修订（第 3 轮谱面）：演示多轮追踪的各种状态。
+
+    相对上一版的变化与预期追踪结果：
+    * m1 低声部 G3→B3、B3→C4：平行五度与强拍不协和消除（resolved），
+      m1b4 弱位不协和保留（carried）；
+    * m2 低声部 B2→A2：大跳未反向与超域仍在但音高变化（pitch_changed），
+      弱位不协和消除（resolved）；C3→A2：隐伏五度变成平行五度
+      （kind_changed），并新增一个超域（new）；
+    * m4 高声部 D5→C6：强拍不协和消失，原位置音符牵涉多个新 finding
+      （ambiguous，候选并列不自动归属）；
+    * m3 / m5 未动：强拍不协和、超域、终止式等问题原样保留（carried）。
+    """
+    upper = [
+        ["C5", "D5", "E5", "F5"],                        # m1 未动
+        ["E5", "F5", "E5", "D5"],                        # m2 未动
+        ["E5", "C5", "D5", "C5"],                        # m3 未动
+        ["E5", "C5", "C6", "C5"],                        # m4 D5→C6（越界，纵向转协和）
+        ["C5", "G4", "D5", "C5"],                        # m5 未动
+    ]
+    lower = [
+        ["F3", "B3", "C4", "G3"],                        # m1 修平行五/强拍不协和
+        ["C3", "A2", "A2", "G2"],                        # m2 B2→A2、C3→A2
+        ["B2", "A2", "G2", "A2"],                        # m3 未动
+        ["A2", "G2", "A2", "G2"],                        # m4 未动
+        ["C3", "C3", "F2", "C3"],                        # m5 未动
+    ]
+    return document("示例2修订版2-第二轮修订", upper, lower)
+
+
 # ---------------------------------------------------------------------------
 # 示例 4：无法分析的记谱——多声部混写 + 时值缺失
 # ---------------------------------------------------------------------------
@@ -370,6 +400,7 @@ def main():
         "good_exercise.musicxml": good_exercise(),
         "bad_exercise.musicxml": bad_exercise(),
         "bad_exercise_revised.musicxml": bad_exercise_revised(),
+        "bad_exercise_revised2.musicxml": bad_exercise_revised2(),
         "broken_notation.musicxml": broken_notation(),
         "species1.musicxml": species1(),
         "species2.musicxml": species2(),

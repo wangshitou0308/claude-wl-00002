@@ -7,7 +7,7 @@ import json
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import counterpoint, musicxml_io, rulesconfig as rc
+from . import counterpoint, musicxml_io, revision, rulesconfig as rc
 from .species import SPECIES_NAMES, VALID_SPECIES
 from .storage import Database
 
@@ -459,3 +459,407 @@ def analysis_export(db: Database, analysis_id: int) -> Dict[str, Any]:
         "verdicts": verdicts,
         "kind_labels_zh": KIND_LABELS_ZH,
     }
+
+
+# ---------------------------------------------------------------------------
+# 修订链
+# ---------------------------------------------------------------------------
+
+def create_chain(db: Database, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """以一份分析为起点建链。链内冻结 species / cantus_part / 规则版本。"""
+    analysis_id = payload.get("analysis_id")
+    if analysis_id is None:
+        raise ServiceError(400, "缺少 analysis_id")
+    row = db.get_analysis(int(analysis_id))
+    if row is None:
+        raise ServiceError(404, f"分析 {analysis_id} 不存在")
+    if row["status"] != "ok":
+        raise ServiceError(400, "分析存在解析错误，不能作为修订链起点",
+                           {"analysis_id": analysis_id, "status": row["status"]})
+    if db.analysis_chain(row["id"]) is not None:
+        raise ServiceError(400, f"分析 {analysis_id} 已属于某条修订链，不能重复入链")
+    if row["species"] is None or not row["cantus_part"]:
+        raise ServiceError(400, "分析缺少 species / cantus_part，无法建链")
+
+    rule_version = json.loads(row["rules_snapshot"]).get("version")
+    title = payload.get("title") or f"修订链（分析 #{row['id']} 起）"
+    chain_id = db.insert_chain(title, row["species"], row["cantus_part"],
+                               row["rule_set_id"], rule_version)
+    revision_id = db.insert_revision(chain_id, 1, row["id"], row["score_id"],
+                                     alignment=None, tracking_summary=None)
+    # 首轮：每条 finding 记一条 initial 追踪，作为后续轮的基准
+    now_rows = []
+    for f in db.query_findings(row["id"]):
+        now_rows.append((chain_id, revision_id, 1, "initial", None, f["id"],
+                         {"rule": "链起点：首轮分析的发现，作为后续轮次追踪基准",
+                          "kind": f["kind"]},
+                         "none", None))
+    if now_rows:
+        db.insert_traces(now_rows)
+    return chain_dict(db, chain_id)
+
+
+def append_revision(db: Database, chain_id: int,
+                    payload: Dict[str, Any]) -> Dict[str, Any]:
+    """向链尾追加一轮分析。
+
+    校验链内一致性（species / cantus_part / 规则版本），并对最新一轮的
+    谱面做声部-小节-拍位对齐；无法对齐时拒绝加入。随后按音符对齐结果
+    追踪上一轮 finding，写出本轮追踪记录与裁定沿用/待复核状态。
+    """
+    chain = db.get_chain(chain_id)
+    if chain is None:
+        raise ServiceError(404, f"修订链 {chain_id} 不存在")
+    analysis_id = payload.get("analysis_id")
+    if analysis_id is None:
+        raise ServiceError(400, "缺少 analysis_id")
+    analysis = db.get_analysis(int(analysis_id))
+    if analysis is None:
+        raise ServiceError(404, f"分析 {analysis_id} 不存在")
+    if analysis["status"] != "ok":
+        raise ServiceError(400, "分析存在解析错误，不能加入修订链",
+                           {"analysis_id": analysis_id, "status": analysis["status"]})
+    if db.analysis_chain(analysis["id"]) is not None:
+        raise ServiceError(400, f"分析 {analysis_id} 已属于某条修订链，不能重复入链")
+
+    # ---- 链内一致性：species / cantus_part / 规则版本 ----------------------
+    mismatches = []
+    if analysis["species"] != chain["species"]:
+        mismatches.append({
+            "field": "species",
+            "chain": chain["species"],
+            "analysis": analysis["species"],
+            "detail": f"链为{SPECIES_NAMES.get(chain['species'])}，"
+                      f"该分析为{SPECIES_NAMES.get(analysis['species'])}",
+        })
+    if analysis["cantus_part"] != chain["cantus_part"]:
+        mismatches.append({
+            "field": "cantus_part",
+            "chain": chain["cantus_part"],
+            "analysis": analysis["cantus_part"],
+            "detail": f"链内定旋律声部为 {chain['cantus_part']}，"
+                      f"该分析为 {analysis['cantus_part']}",
+        })
+    analysis_rule_version = json.loads(analysis["rules_snapshot"]).get("version")
+    if analysis_rule_version != chain["rule_version"]:
+        mismatches.append({
+            "field": "rule_version",
+            "chain": chain["rule_version"],
+            "analysis": analysis_rule_version,
+            "detail": "规则版本不一致；请用与链相同的规则集创建分析",
+        })
+    if mismatches:
+        raise ServiceError(400, "分析与修订链的课型参数不一致，拒绝加入", mismatches)
+
+    # ---- 与最新一轮做谱面对齐 ----------------------------------------------
+    prev_rev = db.latest_revision(chain_id)
+    prev_analysis = db.get_analysis(prev_rev["analysis_id"])
+    prev_score = db.get_score(prev_analysis["score_id"])
+    curr_score = db.get_score(analysis["score_id"])
+    prev_parsed = musicxml_io.parse_score(prev_score["xml"].encode("utf-8"))
+    curr_parsed = musicxml_io.parse_score(curr_score["xml"].encode("utf-8"))
+    alignment = revision.align_scores(prev_parsed, curr_parsed)
+    if not alignment["ok"]:
+        raise ServiceError(
+            400, "两版谱面无法按声部、小节、拍位对齐，拒绝加入修订链",
+            {"checks": alignment["checks"],
+             "prev_score_id": prev_score["id"],
+             "curr_score_id": curr_score["id"]})
+
+    # ---- finding 追踪 -------------------------------------------------------
+    prev_findings = _tracking_findings(db, prev_analysis["id"])
+    curr_findings = _tracking_findings(db, analysis["id"])
+    traces, summary = revision.track_findings(prev_findings, curr_findings,
+                                              alignment)
+
+    seq = prev_rev["seq"] + 1
+    revision_id = db.insert_revision(chain_id, seq, analysis["id"],
+                                     analysis["score_id"], alignment, summary)
+
+    # ---- 裁定沿用与待复核 ----------------------------------------------------
+    prev_verdicts = {f["id"]: db.latest_verdict(f["id"]) for f in prev_findings}
+    trace_rows = []
+    inherited: List[Dict[str, Any]] = []
+    for t in traces:
+        review_state = "none"
+        verdict_source = None
+        pv = prev_verdicts.get(t["prev_finding_id"]) if t["prev_finding_id"] else None
+        if t["status"] == "carried" and pv is not None:
+            # finding 及关联音符未变：沿用教师裁定
+            new_vid = db.add_verdict(
+                t["curr_finding_id"], analysis["id"], pv["decision"],
+                f"[沿用第{seq - 1}轮裁定] {pv['comment'] or ''}".strip(),
+                pv["teacher"])
+            review_state = "inherited"
+            verdict_source = _verdict_source(t["prev_finding_id"], pv, applied=True)
+            inherited.append({"trace_prev_finding_id": t["prev_finding_id"],
+                              "curr_finding_id": t["curr_finding_id"],
+                              "verdict_id": new_vid,
+                              "decision": pv["decision"]})
+        elif t["status"] in revision.PENDING_STATUSES:
+            # 其他情况：进入待复核，保留来源裁定供教师参考
+            review_state = "pending"
+            if pv is not None:
+                verdict_source = _verdict_source(t["prev_finding_id"], pv,
+                                                 applied=False)
+        elif t["status"] == "resolved" and pv is not None:
+            t["evidence"]["prev_verdict"] = {
+                "decision": pv["decision"], "comment": pv["comment"],
+                "teacher": pv["teacher"], "at": pv["created_at"]}
+        trace_rows.append((chain_id, revision_id, seq, t["status"],
+                           t["prev_finding_id"], t["curr_finding_id"],
+                           t["evidence"], review_state, verdict_source))
+    if trace_rows:
+        db.insert_traces(trace_rows)
+
+    return {
+        "chain_id": chain_id,
+        "revision_id": revision_id,
+        "seq": seq,
+        "analysis_id": analysis["id"],
+        "score_id": analysis["score_id"],
+        "alignment": {
+            "checks": alignment["checks"],
+            "warnings": alignment["warnings"],
+            "summary": alignment["summary"],
+        },
+        "tracking_summary": summary,
+        "verdicts_inherited": inherited,
+        "traces": [trace_dict(db, r) for r in
+                   db.query_traces(chain_id, seq=seq)],
+    }
+
+
+def _tracking_findings(db: Database, analysis_id: int) -> List[Dict[str, Any]]:
+    """供追踪算法使用的 finding 简表（含 id/kind/notes）。"""
+    return [{
+        "id": r["id"], "kind": r["kind"], "measure": r["measure"],
+        "beat": r["beat"], "message": r["message"],
+        "notes": json.loads(r["notes_json"]),
+    } for r in db.query_findings(analysis_id)]
+
+
+def _verdict_source(prev_finding_id: int, verdict: sqlite3.Row,
+                    applied: bool) -> Dict[str, Any]:
+    return {
+        "prev_finding_id": prev_finding_id,
+        "applied": applied,
+        "verdict": {"id": verdict["id"], "decision": verdict["decision"],
+                    "comment": verdict["comment"], "teacher": verdict["teacher"],
+                    "at": verdict["created_at"]},
+    }
+
+
+def trace_dict(db: Database, row: sqlite3.Row) -> Dict[str, Any]:
+    out = {
+        "id": row["id"],
+        "chain_id": row["chain_id"],
+        "revision_id": row["revision_id"],
+        "seq": row["seq"],
+        "status": row["status"],
+        "status_zh": revision.STATUS_LABELS_ZH.get(row["status"], row["status"]),
+        "prev_finding_id": row["prev_finding_id"],
+        "curr_finding_id": row["curr_finding_id"],
+        "evidence": json.loads(row["evidence_json"]),
+        "review_state": row["review_state"],
+        "verdict_source": (json.loads(row["verdict_source_json"])
+                           if row["verdict_source_json"] else None),
+        "created_at": row["created_at"],
+    }
+    for side, col in (("prev_finding", row["prev_finding_id"]),
+                      ("curr_finding", row["curr_finding_id"])):
+        if col is None:
+            out[side] = None
+            continue
+        f = db.get_finding(col)
+        out[side] = None if f is None else {
+            "id": f["id"], "kind": f["kind"],
+            "kind_zh": KIND_LABELS_ZH.get(f["kind"], f["kind"]),
+            "severity": f["severity"], "measure": f["measure"],
+            "beat": f["beat"], "message": f["message"],
+            "notes": json.loads(f["notes_json"]),
+        }
+    return out
+
+
+def _revision_brief(db: Database, row: sqlite3.Row) -> Dict[str, Any]:
+    analysis = db.get_analysis(row["analysis_id"])
+    return {
+        "id": row["id"],
+        "seq": row["seq"],
+        "analysis_id": row["analysis_id"],
+        "score_id": row["score_id"],
+        "analysis_status": analysis["status"] if analysis else None,
+        "findings_total": (json.loads(analysis["summary_json"])["total"]
+                           if analysis else None),
+        "tracking_summary": (json.loads(row["tracking_summary_json"])
+                             if row["tracking_summary_json"] else None),
+        "created_at": row["created_at"],
+    }
+
+
+def chain_dict(db: Database, chain_id: int,
+               include_revisions: bool = True) -> Dict[str, Any]:
+    row = db.get_chain(chain_id)
+    if row is None:
+        raise ServiceError(404, f"修订链 {chain_id} 不存在")
+    revisions = db.list_revisions(chain_id)
+    pending = db.query_traces(chain_id, review_states=["pending"])
+    out = {
+        "id": row["id"],
+        "title": row["title"],
+        "species": row["species"],
+        "species_name": SPECIES_NAMES.get(row["species"]),
+        "cantus_part": row["cantus_part"],
+        "rule_set_id": row["rule_set_id"],
+        "rule_version": row["rule_version"],
+        "created_at": row["created_at"],
+        "revision_count": len(revisions),
+        "pending_review_count": len(pending),
+    }
+    if include_revisions:
+        out["revisions"] = [_revision_brief(db, r) for r in revisions]
+    return out
+
+
+def chain_timeline(db: Database, chain_id: int) -> Dict[str, Any]:
+    """修订时间线：逐轮列出追踪结果与判定依据。"""
+    chain = chain_dict(db, chain_id, include_revisions=False)
+    rounds = []
+    for rev in db.list_revisions(chain_id):
+        traces = [trace_dict(db, t)
+                  for t in db.query_traces(chain_id, seq=rev["seq"])]
+        entry = _revision_brief(db, rev)
+        entry["alignment"] = (json.loads(rev["alignment_json"])
+                              if rev["alignment_json"] else None)
+        if entry["alignment"] is not None:
+            # 时间线保留对齐检查与统计，完整音符映射见下载接口
+            entry["alignment"] = {
+                "checks": entry["alignment"]["checks"],
+                "warnings": entry["alignment"]["warnings"],
+                "summary": entry["alignment"]["summary"],
+            }
+        entry["traces"] = traces
+        rounds.append(entry)
+    return {"chain": chain, "rounds": rounds,
+            "status_labels_zh": revision.STATUS_LABELS_ZH}
+
+
+def list_reviews(db: Database, chain_id: int,
+                 query: Dict[str, List[str]]) -> Dict[str, Any]:
+    """待复核筛选：按复核状态（默认 pending）与轮次过滤追踪记录。"""
+    if db.get_chain(chain_id) is None:
+        raise ServiceError(404, f"修订链 {chain_id} 不存在")
+    states = query.get("state") or ["pending"]
+    if states == ["all"]:
+        states = None
+    elif any(s not in revision.REVIEW_STATES for s in states):
+        raise ServiceError(400, f"state 只允许 {revision.REVIEW_STATES} 或 all")
+    seq = None
+    if query.get("seq"):
+        try:
+            seq = int(query["seq"][0])
+        except ValueError:
+            raise ServiceError(400, "seq 必须是整数")
+    rows = db.query_traces(chain_id, seq=seq, review_states=states)
+    return {"chain_id": chain_id,
+            "filter": {"state": states or "all", "seq": seq},
+            "count": len(rows),
+            "reviews": [trace_dict(db, r) for r in rows]}
+
+
+def submit_review(db: Database, chain_id: int,
+                  payload: Dict[str, Any]) -> Dict[str, Any]:
+    """复核一条待复核追踪：可同时对本轮 finding 记录裁定。
+
+    歧义（ambiguous）条目可用 ``chosen_finding_id`` 在候选中指定归属；
+    指定后该候选视为本轮对应 finding，裁定落在它上面。
+    """
+    if db.get_chain(chain_id) is None:
+        raise ServiceError(404, f"修订链 {chain_id} 不存在")
+    trace_id = payload.get("trace_id")
+    if trace_id is None:
+        raise ServiceError(400, "缺少 trace_id")
+    trace = db.get_trace(int(trace_id))
+    if trace is None or trace["chain_id"] != chain_id:
+        raise ServiceError(404, f"追踪记录 {trace_id} 不在链 {chain_id} 中")
+    if trace["review_state"] != "pending":
+        raise ServiceError(400, f"追踪记录 {trace_id} 不在待复核状态"
+                                f"（当前 {trace['review_state']}）")
+
+    chosen = payload.get("chosen_finding_id")
+    if chosen is not None:
+        chosen = int(chosen)
+        if trace["status"] != "ambiguous":
+            raise ServiceError(400, "只有歧义（ambiguous）条目支持 chosen_finding_id")
+        evidence = json.loads(trace["evidence_json"])
+        cand_ids = [c["finding_id"] for c in evidence.get("candidates", [])]
+        if chosen not in cand_ids:
+            raise ServiceError(400, f"finding {chosen} 不在候选列表 {cand_ids} 中")
+
+    decision = payload.get("decision")
+    verdict = None
+    if decision is not None:
+        target = chosen if chosen is not None else trace["curr_finding_id"]
+        if target is None:
+            raise ServiceError(400, "该追踪没有本轮 finding 可裁定；"
+                                    "歧义条目请先给 chosen_finding_id")
+        verdict = record_verdict(db, {
+            "finding_id": target, "decision": decision,
+            "comment": payload.get("comment"),
+            "teacher": payload.get("teacher")})
+    db.mark_trace_reviewed(trace["id"], curr_finding_id=chosen)
+    out = trace_dict(db, db.get_trace(trace["id"]))
+    if verdict is not None:
+        out["verdict_recorded"] = verdict
+    return out
+
+
+def compare_chains(db: Database, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """链间比较：逐轮统计对照 + 两链最新一轮的 finding 增减。"""
+    id_a, id_b = payload.get("chain_id_a"), payload.get("chain_id_b")
+    if id_a is None or id_b is None:
+        raise ServiceError(400, "缺少 chain_id_a / chain_id_b")
+    if int(id_a) == int(id_b):
+        raise ServiceError(400, "必须选择两条不同的链进行比较")
+    chain_a, chain_b = db.get_chain(int(id_a)), db.get_chain(int(id_b))
+    if chain_a is None:
+        raise ServiceError(404, f"修订链 {id_a} 不存在")
+    if chain_b is None:
+        raise ServiceError(404, f"修订链 {id_b} 不存在")
+
+    def rounds(chain_id: int) -> List[Dict[str, Any]]:
+        return [_revision_brief(db, r) for r in db.list_revisions(chain_id)]
+
+    latest_a = db.latest_revision(chain_a["id"])
+    latest_b = db.latest_revision(chain_b["id"])
+    latest_cmp = compare_analyses(db, latest_a["analysis_id"],
+                                  latest_b["analysis_id"], persist=False)
+    return {
+        "chain_a": {**chain_dict(db, chain_a["id"], include_revisions=False),
+                    "rounds": rounds(chain_a["id"])},
+        "chain_b": {**chain_dict(db, chain_b["id"], include_revisions=False),
+                    "rounds": rounds(chain_b["id"])},
+        "compatible": bool(
+            chain_a["species"] == chain_b["species"]
+            and chain_a["cantus_part"] == chain_b["cantus_part"]
+            and chain_a["rule_version"] == chain_b["rule_version"]),
+        "latest_comparison": latest_cmp,
+    }
+
+
+def chain_export(db: Database, chain_id: int) -> Dict[str, Any]:
+    """下载用 JSON：链全貌 + 逐轮对齐/追踪依据 + 裁定历史。"""
+    timeline = chain_timeline(db, chain_id)
+    # 下载版补齐每轮完整对齐结果（含音符映射）
+    for rev_row, entry in zip(db.list_revisions(chain_id), timeline["rounds"]):
+        entry["alignment"] = (json.loads(rev_row["alignment_json"])
+                              if rev_row["alignment_json"] else None)
+        entry["verdicts"] = [
+            {"finding_id": v["finding_id"], "decision": v["decision"],
+             "comment": v["comment"], "teacher": v["teacher"],
+             "created_at": v["created_at"]}
+            for v in db.all_verdicts(rev_row["analysis_id"])
+        ]
+    timeline["kind_labels_zh"] = KIND_LABELS_ZH
+    return timeline

@@ -260,11 +260,25 @@ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding
 <tr><td>GET</td><td><code>/api/analyses/&lt;id&gt;/download</code></td><td>下载分析 JSON</td></tr>
 <tr><td>GET</td><td><code>/api/rules</code></td><td>规则集列表</td></tr>
 </table>
+<h2>多轮修订链</h2>
+<table>
+<tr><th>方法</th><th>路径</th><th>用途</th></tr>
+<tr><td>POST</td><td><code>/api/chains</code></td><td>以一份分析为起点建链</td></tr>
+<tr><td>GET</td><td><code>/api/chains</code></td><td>链列表</td></tr>
+<tr><td>GET</td><td><code>/api/chains/&lt;id&gt;</code></td><td>链详情（含轮次）</td></tr>
+<tr><td>POST</td><td><code>/api/chains/&lt;id&gt;/revisions</code></td><td>追加一轮分析（对齐失败拒绝）</td></tr>
+<tr><td>GET</td><td><code>/api/chains/&lt;id&gt;/timeline</code></td><td>修订时间线（逐轮追踪依据）</td></tr>
+<tr><td>GET</td><td><code>/api/chains/&lt;id&gt;/reviews</code></td><td>待复核筛选（默认 state=pending）</td></tr>
+<tr><td>POST</td><td><code>/api/chains/&lt;id&gt;/reviews</code></td><td>提交复核（可带裁定与歧义归属）</td></tr>
+<tr><td>POST</td><td><code>/api/chains/compare</code></td><td>链间比较（逐轮统计 + 末轮增减）</td></tr>
+<tr><td>GET</td><td><code>/api/chains/&lt;id&gt;/download</code></td><td>下载链完整 JSON</td></tr>
+</table>
 <h2>示例谱</h2>
 <ul>
 <li><a href="/samples/good_exercise.musicxml">good_exercise.musicxml</a> 干净作业（含跨小节延音与延留音）</li>
 <li><a href="/samples/bad_exercise.musicxml">bad_exercise.musicxml</a> 含多类问题的作业</li>
-<li><a href="/samples/bad_exercise_revised.musicxml">bad_exercise_revised.musicxml</a> 上一谱的修订版</li>
+<li><a href="/samples/bad_exercise_revised.musicxml">bad_exercise_revised.musicxml</a> 上一谱的修订版（第 2 轮）</li>
+<li><a href="/samples/bad_exercise_revised2.musicxml">bad_exercise_revised2.musicxml</a> 再修订版（第 3 轮，演示多轮修订链）</li>
 <li><a href="/samples/broken_notation.musicxml">broken_notation.musicxml</a> 无法分析的记谱（多声部混写/时值缺失）</li>
 </ul>
 <h2>五类对位示例（定旋律在低声部，2/2 拍）</h2>
@@ -431,6 +445,52 @@ def h_get_comparison(h, db, query, rid):
     h._send_json(service.comparison_dict(row))
 
 
+# ---------- 修订链 ----------
+
+def h_create_chain(h, db, query):
+    payload = h._read_json()
+    h._send_json(service.create_chain(db, payload), status=201)
+
+
+def h_list_chains(h, db, query):
+    rows = db.list_chains()
+    h._send_json({"chains": [service.chain_dict(db, r["id"],
+                                                include_revisions=False)
+                             for r in rows]})
+
+
+def h_get_chain(h, db, query, rid):
+    h._send_json(service.chain_dict(db, rid))
+
+
+def h_append_revision(h, db, query, rid):
+    payload = h._read_json()
+    h._send_json(service.append_revision(db, rid, payload), status=201)
+
+
+def h_chain_timeline(h, db, query, rid):
+    h._send_json(service.chain_timeline(db, rid))
+
+
+def h_list_reviews(h, db, query, rid):
+    h._send_json(service.list_reviews(db, rid, query))
+
+
+def h_submit_review(h, db, query, rid):
+    payload = h._read_json()
+    h._send_json(service.submit_review(db, rid, payload), status=201)
+
+
+def h_compare_chains(h, db, query):
+    payload = h._read_json()
+    h._send_json(service.compare_chains(db, payload))
+
+
+def h_download_chain(h, db, query, rid):
+    data = service.chain_export(db, rid)
+    h._send_json(data, filename=f"chain-{rid}.json")
+
+
 ROUTES = {
     ("GET", "/"): h_index,
     ("GET", "/docs"): h_docs,
@@ -444,6 +504,9 @@ ROUTES = {
     ("POST", "/api/analyses"): h_create_analysis,
     ("PUT", "/api/verdicts"): h_put_verdict,
     ("POST", "/api/comparisons"): h_compare,
+    ("GET", "/api/chains"): h_list_chains,
+    ("POST", "/api/chains"): h_create_chain,
+    ("POST", "/api/chains/compare"): h_compare_chains,
 }
 
 RESOURCE_ROUTES = {
@@ -456,6 +519,12 @@ RESOURCE_ROUTES = {
     ("GET", "/api/analyses/<id>/download"): h_download_analysis,
     ("GET", "/api/analyses/<id>/verdicts"): h_list_verdicts,
     ("GET", "/api/comparisons/<id>"): h_get_comparison,
+    ("GET", "/api/chains/<id>"): h_get_chain,
+    ("POST", "/api/chains/<id>/revisions"): h_append_revision,
+    ("GET", "/api/chains/<id>/timeline"): h_chain_timeline,
+    ("GET", "/api/chains/<id>/reviews"): h_list_reviews,
+    ("POST", "/api/chains/<id>/reviews"): h_submit_review,
+    ("GET", "/api/chains/<id>/download"): h_download_chain,
 }
 ROUTES.pop(("POST", "/api/rules/copy"), None)
 

@@ -88,6 +88,46 @@ CREATE TABLE IF NOT EXISTS comparisons (
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS chains (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT,
+    species INTEGER NOT NULL,          -- 链内冻结的对位类别
+    cantus_part TEXT NOT NULL,         -- 链内冻结的定旋律声部
+    rule_set_id INTEGER NOT NULL REFERENCES rule_sets(id),
+    rule_version TEXT NOT NULL,        -- 链内冻结的规则版本指纹
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chain_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,              -- 轮次序号（1 起）
+    analysis_id INTEGER NOT NULL REFERENCES analyses(id),
+    score_id INTEGER NOT NULL REFERENCES scores(id),
+    alignment_json TEXT,               -- 与上一轮的谱面对齐结果（首轮为 NULL）
+    tracking_summary_json TEXT,        -- 本轮 finding 追踪统计（首轮为 NULL）
+    created_at TEXT NOT NULL,
+    UNIQUE(chain_id, seq),
+    UNIQUE(chain_id, analysis_id)
+);
+CREATE INDEX IF NOT EXISTS idx_revisions_chain ON chain_revisions(chain_id);
+
+CREATE TABLE IF NOT EXISTS finding_traces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+    revision_id INTEGER NOT NULL REFERENCES chain_revisions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,              -- 冗余轮次号，便于按轮筛选
+    status TEXT NOT NULL,              -- initial/carried/moved/pitch_changed/kind_changed/resolved/new/ambiguous
+    prev_finding_id INTEGER,           -- 上一轮 finding（initial/new 为 NULL）
+    curr_finding_id INTEGER,           -- 本轮 finding（resolved/ambiguous 为 NULL）
+    evidence_json TEXT NOT NULL,       -- 追踪判定依据（音符对齐、候选列表等）
+    review_state TEXT NOT NULL DEFAULT 'none',  -- none/inherited/pending/reviewed
+    verdict_source_json TEXT,          -- 沿用或参考的上轮裁定来源
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_traces_chain ON finding_traces(chain_id, seq);
+CREATE INDEX IF NOT EXISTS idx_traces_review ON finding_traces(chain_id, review_state);
 """
 
 VALID_DECISIONS = ("confirmed", "rejected", "deferred")
@@ -159,7 +199,8 @@ class Database:
 
     def wipe(self) -> None:
         """清空全部业务表（测试隔离用）。"""
-        for table in ("verdicts", "findings", "analyses", "comparisons",
+        for table in ("finding_traces", "chain_revisions", "chains",
+                      "verdicts", "findings", "analyses", "comparisons",
                       "rule_sets", "scores"):
             self.conn.execute(f"DELETE FROM {table}")
         self.conn.commit()
@@ -349,3 +390,134 @@ class Database:
     def get_comparison(self, comparison_id: int) -> Optional[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM comparisons WHERE id = ?", (comparison_id,)).fetchone()
+
+    # ------------------------------------------------------------------
+    # 修订链
+    # ------------------------------------------------------------------
+
+    def insert_chain(self, title: Optional[str], species: int,
+                     cantus_part: str, rule_set_id: int,
+                     rule_version: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO chains (title, species, cantus_part, rule_set_id, "
+            "rule_version, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (title, species, cantus_part, rule_set_id, rule_version, utc_now()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_chain(self, chain_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM chains WHERE id = ?", (chain_id,)).fetchone()
+
+    def list_chains(self) -> List[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM chains ORDER BY id DESC"))
+
+    def insert_revision(self, chain_id: int, seq: int, analysis_id: int,
+                        score_id: int,
+                        alignment: Optional[Dict[str, Any]],
+                        tracking_summary: Optional[Dict[str, Any]]) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO chain_revisions (chain_id, seq, analysis_id, score_id, "
+            "alignment_json, tracking_summary_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chain_id, seq, analysis_id, score_id,
+             json.dumps(alignment, ensure_ascii=False) if alignment is not None else None,
+             json.dumps(tracking_summary, ensure_ascii=False)
+             if tracking_summary is not None else None,
+             utc_now()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_revision(self, revision_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM chain_revisions WHERE id = ?", (revision_id,)).fetchone()
+
+    def list_revisions(self, chain_id: int) -> List[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM chain_revisions WHERE chain_id = ? ORDER BY seq",
+            (chain_id,)))
+
+    def latest_revision(self, chain_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM chain_revisions WHERE chain_id = ? "
+            "ORDER BY seq DESC LIMIT 1", (chain_id,)).fetchone()
+
+    def analysis_chain(self, analysis_id: int) -> Optional[sqlite3.Row]:
+        """该分析是否已属于某条链（一个分析只能入链一次）。"""
+        return self.conn.execute(
+            "SELECT * FROM chain_revisions WHERE analysis_id = ?",
+            (analysis_id,)).fetchone()
+
+    # ------------------------------------------------------------------
+    # finding 追踪
+    # ------------------------------------------------------------------
+
+    def insert_trace(self, chain_id: int, revision_id: int, seq: int,
+                     status: str, prev_finding_id: Optional[int],
+                     curr_finding_id: Optional[int],
+                     evidence: Dict[str, Any], review_state: str,
+                     verdict_source: Optional[Dict[str, Any]]) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO finding_traces (chain_id, revision_id, seq, status, "
+            "prev_finding_id, curr_finding_id, evidence_json, review_state, "
+            "verdict_source_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chain_id, revision_id, seq, status, prev_finding_id,
+             curr_finding_id, json.dumps(evidence, ensure_ascii=False),
+             review_state,
+             json.dumps(verdict_source, ensure_ascii=False)
+             if verdict_source is not None else None,
+             utc_now()))
+        return int(cur.lastrowid)
+
+    def insert_traces(self, rows: List[Tuple]) -> None:
+        """批量写入追踪记录，参数顺序同 :meth:`insert_trace`。"""
+        self.conn.executemany(
+            "INSERT INTO finding_traces (chain_id, revision_id, seq, status, "
+            "prev_finding_id, curr_finding_id, evidence_json, review_state, "
+            "verdict_source_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(cid, rid, seq, status, prev_id, curr_id,
+              json.dumps(evidence, ensure_ascii=False), review_state,
+              json.dumps(source, ensure_ascii=False) if source is not None else None,
+              utc_now())
+             for (cid, rid, seq, status, prev_id, curr_id, evidence,
+                  review_state, source) in rows])
+        self.conn.commit()
+
+    def get_trace(self, trace_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM finding_traces WHERE id = ?", (trace_id,)).fetchone()
+
+    def query_traces(self, chain_id: int,
+                     seq: Optional[int] = None,
+                     statuses: Optional[Iterable[str]] = None,
+                     review_states: Optional[Iterable[str]] = None
+                     ) -> List[sqlite3.Row]:
+        sql = "SELECT * FROM finding_traces WHERE chain_id = ?"
+        params: List[Any] = [chain_id]
+        if seq is not None:
+            sql += " AND seq = ?"
+            params.append(seq)
+        if statuses:
+            sql += f" AND status IN ({','.join('?' for _ in statuses)})"
+            params.extend(statuses)
+        if review_states:
+            sql += f" AND review_state IN ({','.join('?' for _ in review_states)})"
+            params.extend(review_states)
+        sql += " ORDER BY seq, id"
+        return list(self.conn.execute(sql, params))
+
+    def mark_trace_reviewed(self, trace_id: int,
+                            curr_finding_id: Optional[int] = None) -> None:
+        """复核完成：置 review_state=reviewed，可选更新歧义归属。"""
+        if curr_finding_id is not None:
+            self.conn.execute(
+                "UPDATE finding_traces SET review_state = 'reviewed', "
+                "curr_finding_id = ? WHERE id = ?",
+                (curr_finding_id, trace_id))
+        else:
+            self.conn.execute(
+                "UPDATE finding_traces SET review_state = 'reviewed' "
+                "WHERE id = ?", (trace_id,))
+        self.conn.commit()
