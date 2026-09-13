@@ -63,6 +63,8 @@ def analyze(parsed: Dict[str, Any], rules: Dict[str, Any],
         "lower_pid": lower_pid,
         "beat_grid": _build_beat_grid(measures),
         "checkpoints": [],
+        "species": species,
+        "cantus_role": cantus_role,
     }
     ctx["checkpoints"] = _build_checkpoints(ctx, rules)
 
@@ -83,7 +85,94 @@ def analyze(parsed: Dict[str, Any], rules: Dict[str, Any],
         f["finding_code"] = f"F{idx:03d}"
         f["fingerprint"] = _fingerprint(f)
         f["severity"] = rules["severity"].get(f["kind"], "warning")
+        _enrich_trace(f, ctx)
     return {"findings": findings, "context": {"aborted": False}}
+
+
+# ---------------------------------------------------------------------------
+# 判定信息补全：每条发现都带音级、纵向音程、节奏比例
+# ---------------------------------------------------------------------------
+
+def _enrich_trace(finding: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+    """保证每条发现的 trace 含 ``scale_degrees`` / ``vertical_interval`` /
+    ``rhythm_ratio`` 三个键；专项检查已给出的不覆盖，缺失的按谱面补齐。"""
+    trace = finding.setdefault("trace", {})
+    key = None
+    for m in ctx["measures"]:
+        if m.get("key"):
+            key = m["key"]
+            break
+
+    # ---- 音级（按谱面拼写与调式）---------------------------------------
+    if not trace.get("scale_degrees"):
+        degs: Dict[str, str] = {}
+        for n in finding.get("notes", []):
+            if n.get("midi") is None or not n.get("pitch"):
+                continue
+            role = "upper" if n["part_id"] == ctx["upper_pid"] else "lower"
+            if role in degs:
+                continue
+            pitch = rc.parse_pitch_name(n["pitch"])
+            if pitch is None:
+                continue
+            deg = rc.scale_degree(pitch, key)
+            if deg:
+                degs[role] = rc.degree_label(*deg)
+        trace["scale_degrees"] = degs or None
+
+    # ---- 纵向音程 -------------------------------------------------------
+    if not trace.get("vertical_interval"):
+        iv = trace.get("interval")
+        if iv is None and isinstance(trace.get("to"), dict):
+            iv = trace["to"].get("interval")
+        if iv is None:
+            pitches: Dict[str, Dict[str, Any]] = {}
+            for n in finding.get("notes", []):
+                if not n.get("pitch"):
+                    continue
+                role = "upper" if n["part_id"] == ctx["upper_pid"] else "lower"
+                if role not in pitches:
+                    pitch = rc.parse_pitch_name(n["pitch"])
+                    if pitch is not None:
+                        pitches[role] = pitch
+            if "upper" in pitches and "lower" in pitches:
+                iv = rc.interval_info(pitches["lower"], pitches["upper"])["label"]
+        trace["vertical_interval"] = iv
+
+    # ---- 节奏比例 -------------------------------------------------------
+    ratio = trace.get("rhythm_ratio")
+    if not isinstance(ratio, dict):
+        ratio = {"expected": None, "actual": None}
+    ratio.setdefault("expected", None)
+    if not ratio.get("actual"):
+        ratio["actual"] = _actual_ratio(ctx, finding.get("time"))
+    if ctx.get("cantus_role"):
+        ratio["voices"] = "counterpoint:cantus"
+    else:
+        ratio.setdefault("voices", "upper:lower")
+    trace["rhythm_ratio"] = ratio
+
+
+def _actual_ratio(ctx: Dict[str, Any], t: Optional[float]) -> Optional[str]:
+    """t 时刻两声部发声片段的时值比（如 ``2:1``、``4:3``）。"""
+    if t is None:
+        return None
+    from fractions import Fraction
+    if ctx.get("cantus_role"):
+        cp_role = "lower" if ctx["cantus_role"] == "upper" else "upper"
+        first = _sounding(ctx["lines"][cp_role], t)
+        second = _sounding(ctx["lines"][ctx["cantus_role"]], t)
+    else:
+        first = _sounding(ctx["lines"]["upper"], t)
+        second = _sounding(ctx["lines"]["lower"], t)
+    if first is None or second is None:
+        return None
+    d1 = Fraction(first["end"] - first["start"]).limit_denominator(96)
+    d2 = Fraction(second["end"] - second["start"]).limit_denominator(96)
+    if d1 <= 0 or d2 <= 0:
+        return None
+    ratio = d1 / d2
+    return f"{ratio.numerator}:{ratio.denominator}"
 
 
 # ---------------------------------------------------------------------------

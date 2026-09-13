@@ -427,9 +427,6 @@ def _check_harmonic_frame(ctx: Dict[str, Any], rules: Dict[str, Any],
             perfect_ok = False  # 对位在下方时五度等效四度，不作起始
         if not perfect_ok:
             trace = _base_trace(ctx, rules, 0, cf_seg, first, cp_role, cantus_role)
-            trace.pop("species", None)
-            trace.pop("species_name", None)
-            trace.pop("rhythm_ratio", None)
             trace["vertical_interval"] = iv["label"]
             trace["counterpoint_position"] = "below" if cp_role == "lower" else "above"
             trace["rule"] = ("起始音程必须为完全协和（P1/P5/P8；"
@@ -448,9 +445,6 @@ def _check_harmonic_frame(ctx: Dict[str, Any], rules: Dict[str, Any],
         iv = rc.interval_info(low["pitch"], high["pitch"])
         if iv["simple_label"] not in ("P1", "P8"):
             trace = _base_trace(ctx, rules, 0, cf_last, last, cp_role, cantus_role)
-            trace.pop("species", None)
-            trace.pop("species_name", None)
-            trace.pop("rhythm_ratio", None)
             trace["vertical_interval"] = iv["label"]
             trace["rule"] = "终止音程必须为一度或八度"
             out.append(engine._finding(
@@ -493,8 +487,8 @@ def _check_cadence_motion(ctx: Dict[str, Any], rules: Dict[str, Any],
 
     low, high = (cf_fin, cp_fin) if cantus_role == "lower" else (cp_fin, cf_fin)
     iv = rc.interval_info(low["pitch"], high["pitch"])
-    trace = {
-        "key": rc.key_label(key),
+    trace = _base_trace(ctx, rules, 0, cf_fin, cp_fin, cp_role, cantus_role)
+    trace.update({
         "scale_degrees": {
             "cantus_penultimate": _deg_label(key, cf_pen),
             "cantus_final": _deg_label(key, cf_fin),
@@ -507,7 +501,7 @@ def _check_cadence_motion(ctx: Dict[str, Any], rules: Dict[str, Any],
         "contrary_motion": contrary,
         "problems": problems,
         "rule": "倒数第二音到终止音两声部须反向级进",
-    }
+    })
     return [engine._finding(
         "cadence_motion", ctx, cp_fin["start"],
         [engine._seg_note(cp_pen), engine._seg_note(cp_fin),
@@ -548,8 +542,8 @@ def _check_leading_tone(ctx: Dict[str, Any], rules: Dict[str, Any],
             issues.append("导音未级进上行解决到主音")
         if not issues:
             continue
-        trace = {
-            "key": rc.key_label(key),
+        trace = _base_trace(ctx, rules, 0, cf_pen, cp_pen, cp_role, cantus_role)
+        trace.update({
             "voice": role,
             "scale_degrees": {
                 "penultimate": _deg_label(key, pen),
@@ -561,7 +555,7 @@ def _check_leading_tone(ctx: Dict[str, Any], rules: Dict[str, Any],
             "resolution_diatonic_steps": steps,
             "issues": issues,
             "rule": "导音（第七级）须升高半音并级进上行解决到主音",
-        }
+        })
         out.append(engine._finding(
             "leading_tone", ctx, pen["start"],
             [engine._seg_note(pen), engine._seg_note(fin)], trace,

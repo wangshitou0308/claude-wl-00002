@@ -150,20 +150,23 @@ def create_analysis(db: Database, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _resolve_species(payload: Dict[str, Any], parsed: Dict[str, Any]
-                     ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-    """解析并校验 species / cantus 参数。
+                     ) -> Tuple[int, str, str]:
+    """解析并校验 species / cantus 参数（**必填**）。
 
-    返回 ``(species, cantus_role, cantus_part)``；未指定时为全 None。
-    类别非法、定旋律声部不存在、只给其一，均抛 400——绝不擅自改类。
+    返回 ``(species, cantus_role, cantus_part)``。类别非法、定旋律声部
+    不存在、参数缺失，均抛 400——绝不擅自改类或默认猜测。
     """
     species = payload.get("species")
     cantus = payload.get("cantus", payload.get("cantus_part"))
-    if species is None and cantus is None:
-        return None, None, None
-    if species is None or cantus is None:
+    missing = []
+    if species is None:
+        missing.append("species（对位类别 1–5）")
+    if cantus is None:
+        missing.append("cantus（定旋律声部 upper / lower / part_id）")
+    if missing:
         raise ServiceError(
-            400, "请同时指定对位类别 species（1–5）与定旋律声部 cantus"
-                 "（upper / lower / part_id）")
+            400, "创建分析必须指定 " + " 与 ".join(missing)
+                 + "；系统不擅自选择类别或声部")
     if isinstance(species, bool) or not isinstance(species, int) \
             or species not in VALID_SPECIES:
         raise ServiceError(

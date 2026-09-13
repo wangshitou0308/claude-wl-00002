@@ -289,10 +289,18 @@ def rule_fingerprint(rules: Dict[str, Any]) -> str:
 
 def pitch_to_midi(text: str) -> Optional[int]:
     """把 ``C4``/``Bb3``/``F#5`` 这样的音名转 MIDI 号，失败返回 None。"""
+    pitch = parse_pitch_name(text)
+    return None if pitch is None else pitch["midi"]
+
+
+def parse_pitch_name(text: str) -> Optional[Dict[str, Any]]:
+    """把 ``C4``/``Bb3``/``F#5`` 音名解析为音高 dict（step/alter/octave/midi）。"""
+    if not isinstance(text, str):
+        return None
     text = text.strip()
     if len(text) < 2 or text[0].upper() not in _STEPS:
         return None
-    step = _STEPS[text[0].upper()]
+    step = text[0].upper()
     i = 1
     alter = 0
     while i < len(text) and text[i] in "#b":
@@ -305,8 +313,9 @@ def pitch_to_midi(text: str) -> Optional[int]:
     except ValueError:
         return None
     # C 大调音阶半音偏移
-    nat = [0, 2, 4, 5, 7, 9, 11][step]
-    return (octave + 1) * 12 + nat + alter
+    nat = [0, 2, 4, 5, 7, 9, 11][_STEPS[step]]
+    midi = (octave + 1) * 12 + nat + alter
+    return {"step": step, "alter": alter, "octave": octave, "midi": midi}
 
 
 def midi_to_pitch(midi: int) -> str:
@@ -463,6 +472,14 @@ def key_tonic_pc(fifths: int, mode: Optional[str] = None) -> int:
     return base
 
 
+def key_tonic_step(fifths: int, mode: Optional[str] = None) -> int:
+    """调号 -> 主音字母序号（C=0 … B=6）。小调主音在自然音阶下两位。"""
+    step = (fifths * 4) % 7
+    if is_minor_mode(mode):
+        step = (step - 2) % 7
+    return step
+
+
 def key_label(key: Optional[Dict[str, Any]]) -> Optional[str]:
     """调号可读标签，如 ``C 大调`` / ``a 小调``；无调号返回 None。"""
     if not key:
@@ -479,24 +496,29 @@ def key_label(key: Optional[Dict[str, Any]]) -> Optional[str]:
 
 def scale_degree(pitch: Dict[str, Any], key: Optional[Dict[str, Any]]
                  ) -> Optional[Tuple[int, int]]:
-    """音高在调内的音级。返回 ``(级数 1-7, 变化半音)``，无法确定调时返回 None。
+    """音高在调内的音级。返回 ``(级数 1-7, 变化半音)``，无法确定时返回 None。
 
-    变化半音：0=自然级，+1=升高半音（如小调导音 #7），-1=降低半音。
+    **按谱面拼写计算**：级数由音名字母相对主音字母的步数决定，变化半音
+    由实际音高与该级自然音的差决定。因此 C 大调中 ``Db`` 是 ``b2`` 而非
+    ``#1``，``Bb`` 是 ``b7`` 而非 ``#6``；A 小调中 ``G#`` 是 ``#7``
+    （升高的导音），``G`` 是自然的第七级（未升高的下主音）。
     """
     if not key or key.get("fifths") is None:
         return None
-    tonic = key_tonic_pc(key["fifths"], key.get("mode"))
-    scale = _NATURAL_MINOR_SCALE if is_minor_mode(key.get("mode")) else _MAJOR_SCALE
-    rel = (pitch["midi"] - tonic) % 12
-    for idx, semi in enumerate(scale):
-        if rel == semi:
-            return (idx + 1, 0)
-    for idx, semi in enumerate(scale):
-        if rel == (semi + 1) % 12:
-            return (idx + 1, 1)
-        if rel == (semi - 1) % 12:
-            return (idx + 1, -1)
-    return None
+    step = pitch.get("step")
+    if not step or step.upper() not in _STEPS or "midi" not in pitch:
+        return None
+    fifths = key["fifths"]
+    mode = key.get("mode")
+    tonic_step = key_tonic_step(fifths, mode)
+    tonic_pc = key_tonic_pc(fifths, mode)
+    scale = _NATURAL_MINOR_SCALE if is_minor_mode(mode) else _MAJOR_SCALE
+    letter_diff = (_STEPS[step.upper()] - tonic_step) % 7
+    expected_pc = (tonic_pc + scale[letter_diff]) % 12
+    alter = (pitch["midi"] % 12 - expected_pc) % 12
+    if alter > 6:
+        alter -= 12
+    return (letter_diff + 1, alter)
 
 
 def degree_label(degree: int, alter: int = 0) -> str:

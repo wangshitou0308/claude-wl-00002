@@ -278,6 +278,92 @@ def broken_notation():
     return xml
 
 
+# ---------------------------------------------------------------------------
+# 五类对位示例：定旋律（cantus firmus）在低声部，2/2 拍（alla breve），
+# C 大调。五份谱在各自类别 + 默认规则下分析均为 0 条发现。
+# 定旋律：C3 D3 F3 E3 G3 F3 E3 D3 C3（每小节一个全音符，2-1 级进收束）
+# ---------------------------------------------------------------------------
+
+CANTUS = [[(n, "w")] for n in
+          ("C3", "D3", "F3", "E3", "G3", "F3", "E3", "D3", "C3")]
+
+
+def species1():
+    """第一类：一音对一音（全音符对全音符）。"""
+    upper = [[(n, "w")] for n in
+             ("G4", "F4", "A4", "G4", "B4", "A4", "G4", "B4", "C5")]
+    return document("第一类对位示例-一音对一音", upper, CANTUS,
+                    time_sig=(2, 2))
+
+
+def species2():
+    """第二类：二音对一音（每小节两个二分音符，首小节半休止进入）。"""
+    upper = [
+        [("r", "h"), ("G4", "h")],
+        [("F4", "h"), ("E4", "h")],
+        [("F4", "h"), ("A4", "h")],
+        [("B4", "h"), ("A4", "h")],
+        [("G4", "h"), ("B4", "h")],
+        [("C5", "h"), ("A4", "h")],
+        [("B4", "h"), ("G4", "h")],
+        [("A4", "h"), ("B4", "h")],
+        [("C5", "w")],
+    ]
+    return document("第二类对位示例-二音对一音", upper, CANTUS,
+                    time_sig=(2, 2))
+
+
+def species3():
+    """第三类：四音对一音（每小节四个四分音符，首小节四分休止进入）。"""
+    upper = [
+        [("r", "q"), "C5", "B4", "A4"],
+        ["A4", "G4", "F4", "G4"],
+        ["A4", "B4", "C5", "B4"],
+        ["C5", "B4", "A4", "B4"],
+        ["G4", "A4", "B4", "E5"],
+        ["A4", "B4", "A4", "C5"],
+        ["G4", "A4", "B4", "C5"],
+        ["A4", "B4", "C5", "B4"],
+        [("C5", "w")],
+    ]
+    return document("第三类对位示例-四音对一音", upper, CANTUS,
+                    time_sig=(2, 2))
+
+
+def species4():
+    """第四类：切分延留（弱位起音系延音进入下一小节强位，形成延留音）。"""
+    upper = [
+        [("r", "h"), ("G4", "h", {"tie": "start"})],
+        [("G4", "h", {"tie": "stop"}), ("F4", "h", {"tie": "start"})],
+        [("F4", "h", {"tie": "stop"}), ("A4", "h", {"tie": "start"})],
+        [("A4", "h", {"tie": "stop"}), ("G4", "h", {"tie": "start"})],
+        [("G4", "h", {"tie": "stop"}), ("D5", "h", {"tie": "start"})],
+        [("D5", "h", {"tie": "stop"}), ("C5", "h", {"tie": "start"})],
+        [("C5", "h", {"tie": "stop"}), ("C5", "h", {"tie": "start"})],
+        [("C5", "h", {"tie": "stop"}), ("B4", "h")],
+        [("C5", "w")],
+    ]
+    return document("第四类对位示例-切分延留", upper, CANTUS,
+                    time_sig=(2, 2))
+
+
+def species5():
+    """第五类：混合节奏（二分、四分与延留混合的华丽对位）。"""
+    upper = [
+        [("r", "h"), ("G4", "h")],
+        [("F4", "h"), "E4", "F4"],
+        [("F4", "h"), "A4", "C5"],
+        [("G4", "h", {"tie": "start"}), "A4", "B4"],
+        [("G4", "h", {"tie": "stop"}), "B4", "C5"],
+        [("D5", "h"), "C5", "B4"],
+        [("C5", "h"), "B4", "A4"],
+        [("B4", "h"), "A4", "B4"],
+        [("C5", "w")],
+    ]
+    return document("第五类对位示例-混合节奏", upper, CANTUS,
+                    time_sig=(2, 2))
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     files = {
@@ -285,6 +371,11 @@ def main():
         "bad_exercise.musicxml": bad_exercise(),
         "bad_exercise_revised.musicxml": bad_exercise_revised(),
         "broken_notation.musicxml": broken_notation(),
+        "species1.musicxml": species1(),
+        "species2.musicxml": species2(),
+        "species3.musicxml": species3(),
+        "species4.musicxml": species4(),
+        "species5.musicxml": species5(),
     }
     for name, content in files.items():
         path = os.path.join(here, name)
