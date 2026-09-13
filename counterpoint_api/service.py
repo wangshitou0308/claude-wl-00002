@@ -597,15 +597,11 @@ def append_revision(db: Database, chain_id: int,
                               "verdict_id": new_vid,
                               "decision": pv["decision"]})
         elif t["status"] in revision.PENDING_STATUSES:
-            # 其他情况：进入待复核，保留来源裁定供教师参考
+            # 其他情况（含已解决与新出现）：进入待复核，保留来源裁定供教师参考
             review_state = "pending"
             if pv is not None:
                 verdict_source = _verdict_source(t["prev_finding_id"], pv,
                                                  applied=False)
-        elif t["status"] == "resolved" and pv is not None:
-            t["evidence"]["prev_verdict"] = {
-                "decision": pv["decision"], "comment": pv["comment"],
-                "teacher": pv["teacher"], "at": pv["created_at"]}
         trace_rows.append((chain_id, revision_id, seq, t["status"],
                            t["prev_finding_id"], t["curr_finding_id"],
                            t["evidence"], review_state, verdict_source))
@@ -664,6 +660,10 @@ def trace_dict(db: Database, row: sqlite3.Row) -> Dict[str, Any]:
         "review_state": row["review_state"],
         "verdict_source": (json.loads(row["verdict_source_json"])
                            if row["verdict_source_json"] else None),
+        "review_decision": row["review_decision"],
+        "review_comment": row["review_comment"],
+        "review_teacher": row["review_teacher"],
+        "reviewed_at": row["reviewed_at"],
         "created_at": row["created_at"],
     }
     for side, col in (("prev_finding", row["prev_finding_id"]),
@@ -772,8 +772,12 @@ def submit_review(db: Database, chain_id: int,
                   payload: Dict[str, Any]) -> Dict[str, Any]:
     """复核一条待复核追踪：可同时对本轮 finding 记录裁定。
 
-    歧义（ambiguous）条目可用 ``chosen_finding_id`` 在候选中指定归属；
-    指定后该候选视为本轮对应 finding，裁定落在它上面。
+    * 有本轮 finding 的条目（new/moved/pitch_changed/kind_changed）：
+      ``decision`` 会作为裁定写入该 finding；
+    * 已解决（resolved）条目没有本轮 finding，``decision`` 连同备注、
+      教师一起记录在追踪记录本身（review_decision 等字段）；
+    * 歧义（ambiguous）条目可用 ``chosen_finding_id`` 在候选中指定归属，
+      指定后裁定落在该候选上。
     """
     if db.get_chain(chain_id) is None:
         raise ServiceError(404, f"修订链 {chain_id} 不存在")
@@ -798,17 +802,26 @@ def submit_review(db: Database, chain_id: int,
             raise ServiceError(400, f"finding {chosen} 不在候选列表 {cand_ids} 中")
 
     decision = payload.get("decision")
+    if decision is not None:
+        from .storage import VALID_DECISIONS
+        if decision not in VALID_DECISIONS:
+            raise ServiceError(400, f"decision 必须是 {VALID_DECISIONS} 之一")
     verdict = None
     if decision is not None:
         target = chosen if chosen is not None else trace["curr_finding_id"]
-        if target is None:
-            raise ServiceError(400, "该追踪没有本轮 finding 可裁定；"
-                                    "歧义条目请先给 chosen_finding_id")
-        verdict = record_verdict(db, {
-            "finding_id": target, "decision": decision,
-            "comment": payload.get("comment"),
-            "teacher": payload.get("teacher")})
-    db.mark_trace_reviewed(trace["id"], curr_finding_id=chosen)
+        if target is None and trace["status"] == "ambiguous":
+            raise ServiceError(400, "歧义条目请先给 chosen_finding_id 再裁定")
+        if target is not None:
+            # 有本轮 finding：裁定写入该 finding（resolved 无本轮 finding，
+            # 裁定只记录在追踪记录上）
+            verdict = record_verdict(db, {
+                "finding_id": target, "decision": decision,
+                "comment": payload.get("comment"),
+                "teacher": payload.get("teacher")})
+    db.mark_trace_reviewed(trace["id"], curr_finding_id=chosen,
+                           decision=decision,
+                           comment=payload.get("comment"),
+                           teacher=payload.get("teacher"))
     out = trace_dict(db, db.get_trace(trace["id"]))
     if verdict is not None:
         out["verdict_recorded"] = verdict

@@ -695,5 +695,303 @@ class TestStorageAndService(unittest.TestCase):
                 "overrides": {"intervals": {"consonant": ["ZZ9"]}}})
 
 
+class TestRevisionChain(unittest.TestCase):
+    """多轮修订链：建链、追加、追踪、裁定沿用、待复核、时间线与导出。"""
+
+    def setUp(self):
+        self.db = Database(":memory:")
+        # 三轮示例谱：bad → revised → revised2
+        self.analyses = []
+        for name in ("bad_exercise.musicxml", "bad_exercise_revised.musicxml",
+                     "bad_exercise_revised2.musicxml"):
+            score = service.upload_score(self.db, read_sample(name).decode())
+            a = service.create_analysis(self.db, {"score_id": score["id"],
+                                                  "species": 1,
+                                                  "cantus": "lower"})
+            self.assertEqual(a["status"], "ok")
+            self.analyses.append(a)
+
+    def tearDown(self):
+        self.db.close()
+        Database.reset_shared_memory()
+
+    def _traces_by_status(self, traces, status):
+        return [t for t in traces if t["status"] == status]
+
+    def test_three_round_chain_tracking(self):
+        chain = service.create_chain(self.db, {
+            "analysis_id": self.analyses[0]["id"], "title": "三轮链"})
+        self.assertEqual(chain["revision_count"], 1)
+        self.assertEqual(chain["species"], 1)
+        self.assertEqual(chain["cantus_part"], "P2")
+        self.assertTrue(chain["rule_version"])
+
+        r2 = service.append_revision(self.db, chain["id"],
+                                     {"analysis_id": self.analyses[1]["id"]})
+        s2 = r2["tracking_summary"]
+        self.assertEqual(s2["prev_total"], 40)
+        self.assertEqual(s2["curr_total"], 23)
+        self.assertEqual(s2["carried"] + s2["moved"] + s2["pitch_changed"]
+                         + s2["kind_changed"] + s2["resolved"]
+                         + s2["ambiguous"], 40)
+        self.assertEqual(s2["carried"] + s2["moved"] + s2["pitch_changed"]
+                         + s2["kind_changed"] + s2["new"], 23)
+
+        r3 = service.append_revision(self.db, chain["id"],
+                                     {"analysis_id": self.analyses[2]["id"]})
+        s3 = r3["tracking_summary"]
+        # 第三轮示例的设计结果（见 samples/make_samples.py 注释）
+        self.assertEqual(s3["carried"], 16)
+        self.assertEqual(s3["pitch_changed"], 2)
+        self.assertEqual(s3["kind_changed"], 1)
+        self.assertEqual(s3["resolved"], 3)
+        self.assertEqual(s3["ambiguous"], 1)
+        self.assertEqual(s3["new"], 1)
+        # 关键追踪：隐伏五度→平行五度（类型变化）、已解决的平行五度
+        kind_changed = self._traces_by_status(r3["traces"], "kind_changed")[0]
+        self.assertEqual(kind_changed["prev_finding"]["kind"], "hidden_fifth")
+        self.assertEqual(kind_changed["curr_finding"]["kind"], "parallel_fifth")
+        resolved_kinds = {t["prev_finding"]["kind"]
+                          for t in self._traces_by_status(r3["traces"], "resolved")}
+        self.assertIn("parallel_fifth", resolved_kinds)
+        # 歧义条目并列候选，不自动归属
+        amb = self._traces_by_status(r3["traces"], "ambiguous")[0]
+        self.assertIsNone(amb["curr_finding_id"])
+        self.assertGreaterEqual(len(amb["evidence"]["candidates"]), 2)
+        # 每条追踪都带判定依据
+        for t in r3["traces"]:
+            self.assertIn("rule", t["evidence"])
+
+    def test_chain_consistency_enforced(self):
+        chain = service.create_chain(self.db,
+                                     {"analysis_id": self.analyses[0]["id"]})
+        # species 不一致
+        other = service.upload_score(
+            self.db, read_sample("bad_exercise_revised.musicxml").decode())
+        a_sp = service.create_analysis(self.db, {"score_id": other["id"],
+                                                 "species": 2,
+                                                 "cantus": "lower"})
+        with self.assertRaises(service.ServiceError) as cm:
+            service.append_revision(self.db, chain["id"],
+                                    {"analysis_id": a_sp["id"]})
+        self.assertEqual(cm.exception.status, 400)
+        self.assertIn("species", str(cm.exception.details))
+        # cantus 不一致
+        a_cf = service.create_analysis(self.db, {"score_id": other["id"],
+                                                 "species": 1,
+                                                 "cantus": "upper"})
+        with self.assertRaises(service.ServiceError) as cm2:
+            service.append_revision(self.db, chain["id"],
+                                    {"analysis_id": a_cf["id"]})
+        self.assertIn("cantus_part", str(cm2.exception.details))
+        # 规则版本不一致
+        rid = service.ensure_default_rule_set(self.db)
+        new_rs = self.db.copy_rule_set(rid, "宽松规则",
+                                       {"melody": {"max_leap_semitones": 24}})
+        a_rv = service.create_analysis(self.db, {"score_id": other["id"],
+                                                 "species": 1,
+                                                 "cantus": "lower",
+                                                 "rule_set_id": new_rs})
+        with self.assertRaises(service.ServiceError) as cm3:
+            service.append_revision(self.db, chain["id"],
+                                    {"analysis_id": a_rv["id"]})
+        self.assertIn("rule_version", str(cm3.exception.details))
+        # 同一分析不能重复入链
+        with self.assertRaises(service.ServiceError):
+            service.create_chain(self.db,
+                                 {"analysis_id": self.analyses[0]["id"]})
+
+    def test_unalignable_score_rejected(self):
+        chain = service.create_chain(self.db,
+                                     {"analysis_id": self.analyses[0]["id"]})
+        # 小节数不同（6 小节 vs 5 小节）的谱面对齐失败
+        from counterpoint_api.samples_helper import build_doc
+        xml6 = build_doc([[("C5", "w")]] * 6, [[("C3", "w")]] * 6)
+        score6 = service.upload_score(self.db, xml6.decode())
+        a6 = service.create_analysis(self.db, {"score_id": score6["id"],
+                                               "species": 1, "cantus": "lower"})
+        with self.assertRaises(service.ServiceError) as cm:
+            service.append_revision(self.db, chain["id"],
+                                    {"analysis_id": a6["id"]})
+        self.assertEqual(cm.exception.status, 400)
+        self.assertIn("对齐", cm.exception.message)
+        failed = [c for c in cm.exception.details["checks"] if not c["ok"]]
+        self.assertTrue(failed)
+
+    def test_verdict_inheritance_and_pending_review(self):
+        # 首轮裁定一条三轮都原样保留的 finding（m4 弱位不协和）
+        target = next(f for f in self.analyses[0]["findings"]
+                      if f["kind"] == "weak_dissonance_entry"
+                      and f["measure"] == 4)
+        service.record_verdict(self.db, {
+            "finding_id": target["id"], "decision": "confirmed",
+            "comment": "两音同击，确认", "teacher": "王老师"})
+        chain = service.create_chain(self.db,
+                                     {"analysis_id": self.analyses[0]["id"]})
+        r2 = service.append_revision(self.db, chain["id"],
+                                     {"analysis_id": self.analyses[1]["id"]})
+        # carried 且音符未变：裁定沿用
+        self.assertEqual(len(r2["verdicts_inherited"]), 1)
+        inh = self._traces_by_status(r2["traces"], "carried")
+        inherited = [t for t in inh if t["review_state"] == "inherited"]
+        self.assertEqual(len(inherited), 1)
+        self.assertEqual(inherited[0]["verdict_source"]["verdict"]["decision"],
+                         "confirmed")
+        # 沿用后的 finding 上能查到裁定
+        curr_f = self.db.get_finding(inherited[0]["curr_finding_id"])
+        v = self.db.latest_verdict(curr_f["id"])
+        self.assertEqual(v["decision"], "confirmed")
+        self.assertIn("沿用", v["comment"])
+
+        r3 = service.append_revision(self.db, chain["id"],
+                                     {"analysis_id": self.analyses[2]["id"]})
+        self.assertEqual(len(r3["verdicts_inherited"]), 1)
+        # 新增与已解决也进入待复核（不再漏掉）
+        states = {t["status"]: t["review_state"] for t in r3["traces"]
+                  if t["status"] not in ("carried", "initial")}
+        for st in ("new", "resolved", "pitch_changed", "kind_changed",
+                   "ambiguous"):
+            self.assertEqual(states.get(st), "pending", st)
+        # 默认待复核筛选包含 new 与 resolved
+        pend = service.list_reviews(self.db, chain["id"], {})
+        pend_statuses = {t["status"] for t in pend["reviews"]}
+        self.assertIn("new", pend_statuses)
+        self.assertIn("resolved", pend_statuses)
+        # 链详情的待复核计数一致
+        detail = service.chain_dict(self.db, chain["id"])
+        self.assertEqual(detail["pending_review_count"], pend["count"])
+
+    def test_submit_review_flows(self):
+        chain = service.create_chain(self.db,
+                                     {"analysis_id": self.analyses[0]["id"]})
+        service.append_revision(self.db, chain["id"],
+                                {"analysis_id": self.analyses[1]["id"]})
+        r3 = service.append_revision(self.db, chain["id"],
+                                     {"analysis_id": self.analyses[2]["id"]})
+        by_status = {}
+        for t in r3["traces"]:
+            by_status.setdefault(t["status"], t)
+
+        # new：裁定写入本轮 finding
+        out = service.submit_review(self.db, chain["id"], {
+            "trace_id": by_status["new"]["id"], "decision": "confirmed",
+            "comment": "新增越界确认", "teacher": "李老师"})
+        self.assertEqual(out["review_state"], "reviewed")
+        self.assertEqual(out["verdict_recorded"]["decision"], "confirmed")
+        self.assertEqual(out["review_decision"], "confirmed")
+        self.assertIsNotNone(out["reviewed_at"])
+
+        # resolved：无本轮 finding，裁定记录在追踪记录上
+        out = service.submit_review(self.db, chain["id"], {
+            "trace_id": by_status["resolved"]["id"], "decision": "confirmed",
+            "comment": "确认已修复", "teacher": "李老师"})
+        self.assertEqual(out["review_state"], "reviewed")
+        self.assertNotIn("verdict_recorded", out)
+        self.assertEqual(out["review_decision"], "confirmed")
+        self.assertEqual(out["review_comment"], "确认已修复")
+        self.assertEqual(out["review_teacher"], "李老师")
+
+        # ambiguous：chosen_finding_id 指定归属后裁定
+        amb = by_status["ambiguous"]
+        cand = amb["evidence"]["candidates"][0]["finding_id"]
+        out = service.submit_review(self.db, chain["id"], {
+            "trace_id": amb["id"], "chosen_finding_id": cand,
+            "decision": "deferred", "teacher": "李老师"})
+        self.assertEqual(out["review_state"], "reviewed")
+        self.assertEqual(out["curr_finding_id"], cand)
+        self.assertEqual(out["verdict_recorded"]["decision"], "deferred")
+        # 候选外的 finding 拒绝
+        with self.assertRaises(service.ServiceError):
+            service.submit_review(self.db, chain["id"], {
+                "trace_id": by_status["pitch_changed"]["id"],
+                "chosen_finding_id": cand})
+        # 重复复核拒绝
+        with self.assertRaises(service.ServiceError):
+            service.submit_review(self.db, chain["id"], {
+                "trace_id": amb["id"], "decision": "confirmed"})
+
+    def test_moved_note_within_measure(self):
+        """同一声部的音从第 4 拍移到第 3 拍：追踪为 moved，不拆成增删。"""
+        from counterpoint_api.samples_helper import build_doc
+        xml1 = build_doc(
+            [[("C5", "q"), ("D5", "q"), ("E5", "q"), ("E6", "q")],
+             [("C5", "w")]],
+            [[("F3", "q"), ("G3", "q"), ("A3", "q"), ("G3", "q")],
+             [("C3", "w")]])
+        xml2 = build_doc(
+            [[("C5", "q"), ("D5", "q"), ("E6", "q"), ("E5", "q")],
+             [("C5", "w")]],
+            [[("F3", "q"), ("G3", "q"), ("A3", "q"), ("G3", "q")],
+             [("C3", "w")]])
+        s1 = service.upload_score(self.db, xml1.decode())
+        s2 = service.upload_score(self.db, xml2.decode())
+        a1 = service.create_analysis(self.db, {"score_id": s1["id"],
+                                               "species": 1, "cantus": "lower"})
+        a2 = service.create_analysis(self.db, {"score_id": s2["id"],
+                                               "species": 1, "cantus": "lower"})
+        chain = service.create_chain(self.db, {"analysis_id": a1["id"]})
+        r2 = service.append_revision(self.db, chain["id"],
+                                     {"analysis_id": a2["id"]})
+        moved = self._traces_by_status(r2["traces"], "moved")
+        self.assertTrue(moved, "换位移动应识别为 moved")
+        rv = [t for t in moved
+              if t["prev_finding"]["kind"] == "range_violation"]
+        self.assertEqual(len(rv), 1)
+        self.assertEqual(rv[0]["prev_finding"]["beat"], "4")
+        self.assertEqual(rv[0]["curr_finding"]["beat"], "3")
+        self.assertEqual(rv[0]["curr_finding"]["kind"], "range_violation")
+        # 对齐结果中 moved 计入摘要
+        self.assertGreaterEqual(r2["alignment"]["summary"]["moved"], 1)
+
+    def test_timeline_export_and_chain_compare(self):
+        chain = service.create_chain(self.db,
+                                     {"analysis_id": self.analyses[0]["id"]})
+        service.append_revision(self.db, chain["id"],
+                                {"analysis_id": self.analyses[1]["id"]})
+        service.append_revision(self.db, chain["id"],
+                                {"analysis_id": self.analyses[2]["id"]})
+        # 时间线：逐轮依据
+        tl = service.chain_timeline(self.db, chain["id"])
+        self.assertEqual(len(tl["rounds"]), 3)
+        self.assertEqual(tl["rounds"][0]["traces"][0]["status"], "initial")
+        self.assertIsNone(tl["rounds"][0]["alignment"])
+        for rnd in tl["rounds"][1:]:
+            self.assertTrue(rnd["alignment"]["checks"])
+            self.assertTrue(rnd["traces"])
+            for t in rnd["traces"]:
+                self.assertIn("rule", t["evidence"])
+        # 导出：含完整对齐（音符映射）与每轮裁定
+        exp = service.chain_export(self.db, chain["id"])
+        self.assertIn("note_map", exp["rounds"][1]["alignment"])
+        self.assertIn("verdicts", exp["rounds"][0])
+        self.assertIn("kind_labels_zh", exp)
+        # 筛选/时间线/导出的复核状态一致
+        pend = service.list_reviews(self.db, chain["id"], {})
+        tl_pending = [t for r in tl["rounds"] for t in r["traces"]
+                      if t["review_state"] == "pending"]
+        exp_pending = [t for r in exp["rounds"] for t in r["traces"]
+                       if t["review_state"] == "pending"]
+        self.assertEqual(len(pend["reviews"]), len(tl_pending))
+        self.assertEqual(len(tl_pending), len(exp_pending))
+        # 链间比较（第二条链用同谱面新建的分析，一个分析只能入链一次）
+        a1b = service.create_analysis(
+            self.db, {"score_id": self.analyses[1]["score_id"],
+                      "species": 1, "cantus": "lower"})
+        a2b = service.create_analysis(
+            self.db, {"score_id": self.analyses[2]["score_id"],
+                      "species": 1, "cantus": "lower"})
+        chain2 = service.create_chain(self.db, {"analysis_id": a1b["id"]})
+        service.append_revision(self.db, chain2["id"],
+                                {"analysis_id": a2b["id"]})
+        cmp_ = service.compare_chains(self.db, {"chain_id_a": chain["id"],
+                                                "chain_id_b": chain2["id"]})
+        self.assertTrue(cmp_["compatible"])
+        self.assertEqual(len(cmp_["chain_a"]["rounds"]), 3)
+        self.assertEqual(len(cmp_["chain_b"]["rounds"]), 2)
+        self.assertIn("latest_comparison", cmp_)
+        self.assertEqual(cmp_["latest_comparison"]["counts"]["revised_total"],
+                         self.analyses[2]["summary"]["total"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

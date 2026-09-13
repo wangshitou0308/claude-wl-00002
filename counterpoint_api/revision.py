@@ -9,7 +9,10 @@
 * 小节：小节数必须一致，且逐小节拍号（``beats``/``beat_type``）一致；
 * 拍位：满足前两条后，逐声部把音符按 ``(小节, 起始拍位)`` 配对——
   同一起点的音符一一对应（单声部每时刻至多一个音符，配对无歧义），
-  仅一侧存在的音符记为新增/删除。
+  仅一侧存在的音符记为新增/删除；
+* 位置移动：槽位配对后，同一小节内某音高在旧版恰消失一次、在新版
+  恰出现一次（含被误记为音高变化的换位）时，重新配对为 moved；
+  跨小节移动与多候选情形不予猜测，保持删除/新增原样。
 
 任一硬性条件不满足即 ``ok=False``（调用方拒绝加入链）。调号变化不阻断，
 但记入 ``warnings``。
@@ -19,7 +22,7 @@
 以音符对齐结果追踪上一轮每条 finding 在本轮的去向，状态机：
 
 * ``carried``       原样保留：类型相同，相关音符的声部、时间区间、音高全未变；
-* ``moved``         位置移动：类型相同，音符时间区间（时值/序号）变化，音高未变；
+* ``moved``         位置移动：类型相同，音符拍位/时值/序号变化，音高未变；
 * ``pitch_changed`` 音高变化：类型相同、位置对应，但至少一个音符音高（或休止状态）变化；
 * ``kind_changed``  类型变化：同一批音符对应到不同类型的 finding；
 * ``resolved``      已解决：本轮无对应 finding（含相关音符被删除）；
@@ -46,8 +49,10 @@ TRACE_STATUSES = ("initial", "carried", "moved", "pitch_changed",
 #: 复核状态：none 无需复核 / inherited 裁定已沿用 / pending 待复核 / reviewed 已复核
 REVIEW_STATES = ("none", "inherited", "pending", "reviewed")
 
-#: 进入待复核的追踪状态
-PENDING_STATUSES = ("moved", "pitch_changed", "kind_changed", "ambiguous")
+#: 进入待复核的追踪状态：除「原样保留」与「首轮记录」外的一切变化，
+#: 教师都需要确认（含已解决与新出现，确认后才算完成本轮审阅）。
+PENDING_STATUSES = ("moved", "pitch_changed", "kind_changed",
+                    "ambiguous", "resolved", "new")
 
 STATUS_LABELS_ZH = {
     "initial": "首轮记录",
@@ -130,50 +135,154 @@ def align_scores(prev: Dict[str, Any], curr: Dict[str, Any]) -> Dict[str, Any]:
     # ---- 拍位：逐声部音符配对 ------------------------------------------------
     note_map: Dict[str, Dict[str, Any]] = {}
     added: List[str] = []
-    summary = {"paired": 0, "same": 0, "pitch_changed": 0,
+    summary = {"paired": 0, "same": 0, "pitch_changed": 0, "moved": 0,
                "duration_changed": 0, "added": 0, "removed": 0}
     if ok:
         for pid in prev_parts:
             prev_events = _index_events(prev["events"], pid)
             curr_events = _index_events(curr["events"], pid)
+            pairs: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
+            removed: List[Dict[str, Any]] = []
+            part_added: List[Dict[str, Any]] = []
             for key in sorted(set(prev_events) | set(curr_events)):
                 pe, ce = prev_events.get(key), curr_events.get(key)
                 if pe is not None and ce is not None:
-                    change = _note_change(pe, ce)
-                    note_map[pe["id"]] = {
-                        "curr": ce["id"],
-                        "change": change,
-                        "part_id": pid,
-                        "measure": pe["measure"],
-                        "prev_note_index": pe["note_index"],
-                        "curr_note_index": ce["note_index"],
-                        "prev_pitch": _pitch_label(pe),
-                        "curr_pitch": _pitch_label(ce),
-                        "prev_duration": pe["duration"],
-                        "curr_duration": ce["duration"],
-                    }
-                    summary["paired"] += 1
-                    if change == "same":
-                        summary["same"] += 1
-                    elif "pitch" in change or change == "rest_changed":
-                        summary["pitch_changed"] += 1
-                    else:
-                        summary["duration_changed"] += 1
+                    pairs.append((pe, ce, _note_change(pe, ce)))
                 elif pe is not None:
-                    note_map[pe["id"]] = {
-                        "curr": None, "change": "removed",
-                        "part_id": pid, "measure": pe["measure"],
-                        "prev_note_index": pe["note_index"],
-                        "prev_pitch": _pitch_label(pe),
-                        "prev_duration": pe["duration"],
-                    }
-                    summary["removed"] += 1
+                    removed.append(pe)
                 else:
-                    added.append(ce["id"])
-                    summary["added"] += 1
+                    part_added.append(ce)
+            # 同小节内“失而复得”的同音高音符重新配对为位置移动，
+            # 避免把换位/移动误记为音高变化或增删
+            pairs, removed, part_added = _repair_moved_notes(
+                pairs, removed, part_added)
+
+            for pe, ce, change in pairs:
+                entry: Dict[str, Any] = {
+                    "curr": ce["id"],
+                    "change": change,
+                    "part_id": pid,
+                    "prev_measure": pe["measure"],
+                    "curr_measure": ce["measure"],
+                    "prev_note_index": pe["note_index"],
+                    "curr_note_index": ce["note_index"],
+                    "prev_start": pe["start"],
+                    "curr_start": ce["start"],
+                    "prev_pitch": _pitch_label(pe),
+                    "curr_pitch": _pitch_label(ce),
+                    "prev_duration": pe["duration"],
+                    "curr_duration": ce["duration"],
+                }
+                note_map[pe["id"]] = entry
+                summary["paired"] += 1
+                if change == "same":
+                    summary["same"] += 1
+                elif change == "moved":
+                    summary["moved"] += 1
+                elif "pitch" in change or change == "rest_changed":
+                    summary["pitch_changed"] += 1
+                else:
+                    summary["duration_changed"] += 1
+            for pe in removed:
+                note_map[pe["id"]] = {
+                    "curr": None, "change": "removed",
+                    "part_id": pid, "prev_measure": pe["measure"],
+                    "prev_note_index": pe["note_index"],
+                    "prev_start": pe["start"],
+                    "prev_pitch": _pitch_label(pe),
+                    "prev_duration": pe["duration"],
+                }
+                summary["removed"] += 1
+            for ce in part_added:
+                added.append(ce["id"])
+                summary["added"] += 1
 
     return {"ok": ok, "checks": checks, "warnings": warnings,
             "note_map": note_map, "added": added, "summary": summary}
+
+
+def _repair_moved_notes(
+        pairs: List[Tuple[Dict[str, Any], Dict[str, Any], str]],
+        removed: List[Dict[str, Any]],
+        added: List[Dict[str, Any]]
+        ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any], str]],
+                   List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """同小节内“失而复得”的同音高音符重新配对为位置移动（moved）。
+
+    槽位配对只能看到「同一拍位上的前后音符」：一个音从第 4 拍移到第 3 拍
+    （或与别的音换位）时，会被误记为两处音高变化（或一删一增）。本函数在
+    槽位配对之后检查：同一小节内某个音高在旧版**恰消失一次**、在新版
+    **恰出现一次**时，把这两个事件重新配对为 moved。
+
+    * 只限同一小节（跨小节的移动不予猜测，保持删除/新增原样）；
+    * 消失与出现都必须唯一，否则不配对（不凭相似度自动归属）；
+    * 被拆散的槽位对，其另一端回到删除/新增池，不再参与本轮配对。
+    """
+    lost: Dict[Tuple[int, int], List[Tuple[str, int, Dict[str, Any]]]] = {}
+    gained: Dict[Tuple[int, int], List[Tuple[str, int, Dict[str, Any]]]] = {}
+
+    def _lose(source: str, idx: int, ev: Dict[str, Any]) -> None:
+        if ev.get("pitch") is None:
+            return
+        lost.setdefault((ev["measure_index"], ev["pitch"]["midi"]), []).append(
+            (source, idx, ev))
+
+    def _gain(source: str, idx: int, ev: Dict[str, Any]) -> None:
+        if ev.get("pitch") is None:
+            return
+        gained.setdefault((ev["measure_index"], ev["pitch"]["midi"]), []).append(
+            (source, idx, ev))
+
+    for i, (pe, ce, change) in enumerate(pairs):
+        if change in ("pitch", "pitch+duration"):
+            _lose("pair", i, pe)
+            _gain("pair", i, ce)
+        elif change == "rest_changed":
+            _lose("pair", i, pe)   # note→rest：音高消失
+            _gain("pair", i, ce)   # rest→note：音高出现
+    for j, pe in enumerate(removed):
+        _lose("removed", j, pe)
+    for j, ce in enumerate(added):
+        _gain("added", j, ce)
+
+    moved: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for key in sorted(set(lost) & set(gained)):
+        ls, gs = lost[key], gained[key]
+        if len(ls) == 1 and len(gs) == 1:
+            moved.append((ls[0][2], gs[0][2]))
+    if not moved:
+        return pairs, removed, added
+
+    moved_prev = {pe["id"] for pe, _ in moved}
+    moved_curr = {ce["id"] for _, ce in moved}
+    # 标记被 moved 端点拆散的槽位对
+    dissolved = set()
+    for i, (pe, ce, _change) in enumerate(pairs):
+        if pe["id"] in moved_prev or ce["id"] in moved_curr:
+            dissolved.add(i)
+
+    new_pairs: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
+    out_removed: List[Dict[str, Any]] = []
+    out_added: List[Dict[str, Any]] = []
+    for i, (pe, ce, change) in enumerate(pairs):
+        if i in dissolved:
+            # 被拆散的对：未被 moved 消费的一端回到删除/新增池
+            if pe["id"] not in moved_prev:
+                out_removed.append(pe)
+            if ce["id"] not in moved_curr:
+                out_added.append(ce)
+            continue
+        new_pairs.append((pe, ce, change))
+    for pe in removed:
+        if pe["id"] not in moved_prev:
+            out_removed.append(pe)
+    for ce in added:
+        if ce["id"] not in moved_curr:
+            out_added.append(ce)
+    for pe, ce in moved:
+        new_pairs.append((pe, ce, "moved"))
+    new_pairs.sort(key=lambda p: (p[0]["measure_index"], p[0]["start"]))
+    return new_pairs, out_removed, out_added
 
 
 def _index_events(events: List[Dict[str, Any]], part_id: str
@@ -270,14 +379,17 @@ def track_findings(prev_findings: List[Dict[str, Any]],
                                        "change": "removed"})
             else:
                 mapped_ids.append(entry["curr"])
-                note_alignment.append({
-                    "prev": n["event_id"], "curr": entry["curr"],
-                    "change": entry["change"],
-                    "prev_pitch": entry.get("prev_pitch"),
-                    "curr_pitch": entry.get("curr_pitch"),
-                    "prev_duration": entry.get("prev_duration"),
-                    "curr_duration": entry.get("curr_duration"),
-                })
+                na: Dict[str, Any] = {"prev": n["event_id"],
+                                      "curr": entry["curr"],
+                                      "change": entry["change"]}
+                for field in ("prev_measure", "curr_measure",
+                              "prev_note_index", "curr_note_index",
+                              "prev_start", "curr_start",
+                              "prev_pitch", "curr_pitch",
+                              "prev_duration", "curr_duration"):
+                    if field in entry:
+                        na[field] = entry[field]
+                note_alignment.append(na)
         mapped_key = frozenset(mapped_ids)
         exact_ids = [] if removed_notes else [
             f["id"] for f in curr_findings if curr_keys[f["id"]] == mapped_key]
@@ -364,9 +476,9 @@ def track_findings(prev_findings: List[Dict[str, Any]],
             if changes == {"same"}:
                 status = "carried"
                 rule = "类型相同，相关音符的声部、时间区间与音高均未变"
-            elif changes <= {"same", "duration"}:
+            elif changes <= {"same", "duration", "moved"}:
                 status = "moved"
-                rule = "类型相同、音高未变，但相关音符的时间区间（时值/序号）变化"
+                rule = "类型相同、音高未变，但相关音符的位置（拍位/时值/序号）变化"
             else:
                 status = "pitch_changed"
                 rule = "类型相同、位置对应，但至少一个相关音符的音高/休止状态变化"

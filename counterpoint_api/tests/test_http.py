@@ -268,6 +268,125 @@ class TestHTTPApi(unittest.TestCase):
             status, _, _ = srv.request("/api/nope")
             self.assertEqual(status, 404)
 
+    def test_revision_chain_over_http(self):
+        with ServerHarness() as srv:
+            # 上传三轮谱面并分别建分析
+            analysis_ids = []
+            for name in ("bad_exercise.musicxml", "bad_exercise_revised.musicxml",
+                         "bad_exercise_revised2.musicxml"):
+                score_id = json.loads(srv.request(
+                    "/api/scores", "POST", raw=read_sample(name),
+                    ctype="application/xml")[2])["id"]
+                status, _, body = srv.request("/api/analyses", "POST", {
+                    "score_id": score_id, "species": 1, "cantus": "lower"})
+                self.assertEqual(status, 201, body)
+                analysis_ids.append(json.loads(body)["id"])
+
+            # 建链
+            status, _, body = srv.request("/api/chains", "POST", {
+                "analysis_id": analysis_ids[0], "title": "HTTP 链"})
+            self.assertEqual(status, 201, body)
+            chain = json.loads(body)
+            self.assertEqual(chain["revision_count"], 1)
+            self.assertEqual(chain["species"], 1)
+            self.assertEqual(chain["cantus_part"], "P2")
+            self.assertTrue(chain["rule_version"])
+
+            # 追加第二轮、第三轮
+            for aid in analysis_ids[1:]:
+                status, _, body = srv.request(
+                    f"/api/chains/{chain['id']}/revisions", "POST",
+                    {"analysis_id": aid})
+                self.assertEqual(status, 201, body)
+            third = json.loads(body)
+            summary = third["tracking_summary"]
+            self.assertEqual(summary["carried"], 16)
+            self.assertEqual(summary["resolved"], 3)
+            self.assertEqual(summary["new"], 1)
+            self.assertEqual(summary["ambiguous"], 1)
+
+            # 追加参数不一致的分析：species 不同 → 400
+            score_id = json.loads(srv.request(
+                "/api/scores", "POST",
+                raw=read_sample("bad_exercise_revised.musicxml"),
+                ctype="application/xml")[2])["id"]
+            bad_a = json.loads(srv.request("/api/analyses", "POST", {
+                "score_id": score_id, "species": 3, "cantus": "lower"})[2])
+            status, _, body = srv.request(
+                f"/api/chains/{chain['id']}/revisions", "POST",
+                {"analysis_id": bad_a["id"]})
+            self.assertEqual(status, 400)
+
+            # 时间线：三轮，逐轮依据
+            status, _, body = srv.request(f"/api/chains/{chain['id']}/timeline")
+            self.assertEqual(status, 200)
+            timeline = json.loads(body)
+            self.assertEqual(len(timeline["rounds"]), 3)
+            self.assertEqual(timeline["rounds"][0]["traces"][0]["status"],
+                             "initial")
+            for rnd in timeline["rounds"][1:]:
+                for t in rnd["traces"]:
+                    self.assertIn("rule", t["evidence"])
+
+            # 待复核：默认 pending，含 new 与 resolved
+            status, _, body = srv.request(f"/api/chains/{chain['id']}/reviews")
+            reviews = json.loads(body)["reviews"]
+            statuses = {t["status"] for t in reviews}
+            self.assertIn("new", statuses)
+            self.assertIn("resolved", statuses)
+            self.assertTrue(all(t["review_state"] == "pending"
+                                for t in reviews))
+
+            # 提交复核：对一条 new 记录裁定
+            new_trace = next(t for t in reviews if t["status"] == "new")
+            status, _, body = srv.request(
+                f"/api/chains/{chain['id']}/reviews", "POST", {
+                    "trace_id": new_trace["id"], "decision": "confirmed",
+                    "teacher": "李老师"})
+            self.assertEqual(status, 201, body)
+            reviewed = json.loads(body)
+            self.assertEqual(reviewed["review_state"], "reviewed")
+            self.assertEqual(reviewed["review_decision"], "confirmed")
+            self.assertEqual(reviewed["verdict_recorded"]["decision"],
+                             "confirmed")
+            # 待复核计数减少
+            after = json.loads(srv.request(
+                f"/api/chains/{chain['id']}/reviews")[2])
+            self.assertEqual(after["count"], len(reviews) - 1)
+
+            # 链间比较
+            a1b = json.loads(srv.request("/api/analyses", "POST", {
+                "score_id": json.loads(srv.request(
+                    f"/api/analyses/{analysis_ids[1]}")[2])["score_id"],
+                "species": 1, "cantus": "lower"})[2])
+            chain2 = json.loads(srv.request("/api/chains", "POST", {
+                "analysis_id": a1b["id"]})[2])
+            status, _, body = srv.request("/api/chains/compare", "POST", {
+                "chain_id_a": chain["id"], "chain_id_b": chain2["id"]})
+            self.assertEqual(status, 200, body)
+            cmp_ = json.loads(body)
+            self.assertTrue(cmp_["compatible"])
+            self.assertIn("latest_comparison", cmp_)
+
+            # 下载链 JSON
+            status, ctype, body = srv.request(
+                f"/api/chains/{chain['id']}/download")
+            self.assertEqual(status, 200)
+            self.assertEqual(ctype, "application/octet-stream")
+            exported = json.loads(body)
+            self.assertEqual(len(exported["rounds"]), 3)
+            self.assertIn("note_map", exported["rounds"][1]["alignment"])
+            # 导出与时间线的复核状态一致
+            exp_states = {t["id"]: t["review_state"]
+                          for r in exported["rounds"] for t in r["traces"]}
+            tl_states = {t["id"]: t["review_state"]
+                         for r in timeline["rounds"] for t in r["traces"]}
+            for tid, state in exp_states.items():
+                if tid in tl_states and state != tl_states[tid]:
+                    # 时间线请求早于复核提交，仅允许 pending→reviewed 的方向
+                    self.assertEqual(tl_states[tid], "pending")
+                    self.assertEqual(state, "reviewed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

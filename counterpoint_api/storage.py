@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS finding_traces (
     evidence_json TEXT NOT NULL,       -- 追踪判定依据（音符对齐、候选列表等）
     review_state TEXT NOT NULL DEFAULT 'none',  -- none/inherited/pending/reviewed
     verdict_source_json TEXT,          -- 沿用或参考的上轮裁定来源
+    review_decision TEXT,              -- 复核裁定（confirmed/rejected/deferred）
+    review_comment TEXT,               -- 复核备注
+    review_teacher TEXT,               -- 复核教师
+    reviewed_at TEXT,                  -- 复核完成时间
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_traces_chain ON finding_traces(chain_id, seq);
@@ -168,12 +172,21 @@ class Database:
         self.conn.commit()
 
     def _migrate(self) -> None:
-        """老库补列：analyses 增加对位类别与定旋律声部。"""
+        """老库补列：analyses 增加对位类别与定旋律声部；finding_traces 增加复核元数据。"""
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(analyses)")}
         if "species" not in cols:
             self.conn.execute("ALTER TABLE analyses ADD COLUMN species INTEGER")
         if "cantus_part" not in cols:
             self.conn.execute("ALTER TABLE analyses ADD COLUMN cantus_part TEXT")
+        tcols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(finding_traces)")}
+        for col, ddl in (("review_decision", "TEXT"),
+                         ("review_comment", "TEXT"),
+                         ("review_teacher", "TEXT"),
+                         ("reviewed_at", "TEXT")):
+            if tcols and col not in tcols:
+                self.conn.execute(
+                    f"ALTER TABLE finding_traces ADD COLUMN {col} {ddl}")
 
     def close(self) -> None:
         # 共享内存连接由进程持有，单次 close 不真正关闭
@@ -509,15 +522,24 @@ class Database:
         return list(self.conn.execute(sql, params))
 
     def mark_trace_reviewed(self, trace_id: int,
-                            curr_finding_id: Optional[int] = None) -> None:
-        """复核完成：置 review_state=reviewed，可选更新歧义归属。"""
+                            curr_finding_id: Optional[int] = None,
+                            decision: Optional[str] = None,
+                            comment: Optional[str] = None,
+                            teacher: Optional[str] = None) -> None:
+        """复核完成：置 review_state=reviewed，记录复核裁定与时间，
+        可选更新歧义归属（curr_finding_id）。"""
         if curr_finding_id is not None:
             self.conn.execute(
                 "UPDATE finding_traces SET review_state = 'reviewed', "
-                "curr_finding_id = ? WHERE id = ?",
-                (curr_finding_id, trace_id))
+                "curr_finding_id = ?, review_decision = ?, "
+                "review_comment = ?, review_teacher = ?, reviewed_at = ? "
+                "WHERE id = ?",
+                (curr_finding_id, decision, comment, teacher, utc_now(),
+                 trace_id))
         else:
             self.conn.execute(
-                "UPDATE finding_traces SET review_state = 'reviewed' "
-                "WHERE id = ?", (trace_id,))
+                "UPDATE finding_traces SET review_state = 'reviewed', "
+                "review_decision = ?, review_comment = ?, "
+                "review_teacher = ?, reviewed_at = ? WHERE id = ?",
+                (decision, comment, teacher, utc_now(), trace_id))
         self.conn.commit()
