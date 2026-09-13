@@ -33,8 +33,14 @@ from .musicxml_io import format_beat
 # 数据准备
 # ---------------------------------------------------------------------------
 
-def analyze(parsed: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
-    """执行分析。返回 ``{"findings": [...], "context": {...}}``。"""
+def analyze(parsed: Dict[str, Any], rules: Dict[str, Any],
+            species: Optional[int] = None,
+            cantus_role: Optional[str] = None) -> Dict[str, Any]:
+    """执行分析。返回 ``{"findings": [...], "context": {...}}``。
+
+    指定 ``species``（1–5）与 ``cantus_role``（定旋律声部 upper/lower）时，
+    在通用检查之外追加对位类别校验（见 :mod:`counterpoint_api.species`）。
+    """
     if parsed.get("fatal"):
         return {"findings": [], "context": {"aborted": True,
                                             "reason": "谱面存在 error 级记谱问题，未执行分析。"}}
@@ -67,6 +73,10 @@ def analyze(parsed: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
     for role in ("upper", "lower"):
         findings += _check_melody(ctx, rules, role)
     findings += _check_repeated_highest(ctx, rules)
+
+    if species is not None and cantus_role is not None:
+        from . import species as species_mod  # 延迟导入，避免循环依赖
+        findings += species_mod.check(ctx, rules, species, cantus_role)
 
     findings.sort(key=lambda f: (f.get("time", 0.0), f["kind"]))
     for idx, f in enumerate(findings, start=1):

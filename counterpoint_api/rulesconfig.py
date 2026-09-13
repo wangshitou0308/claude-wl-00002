@@ -113,6 +113,20 @@ DEFAULT_RULES: Dict[str, Any] = {
         # 声部超越（前一纵向点不交叉、当前点越过）额外检查，默认关闭
         "check_overlap": False,
     },
+    "species": {
+        # 首小节允许对位声部以休止符开始（如第二类/第四类的半休止）
+        "allow_first_measure_rest": True,
+        # 首小节休止允许的最大长度（四分音符数）
+        "first_measure_rest_max_quarters": 2.0,
+        # 终止小节允许对位声部用全音符收束（不按类别节奏要求）
+        "final_measure_whole_note": True,
+        # 倒数第二小节允许灵活节奏（接近终止时可打破类别节奏型）
+        "penultimate_measure_flexible": True,
+        # 第五类要求全曲至少两种不同时值（混合节奏）
+        "species5_require_mixed_values": True,
+        # 第五类允许八分音符
+        "species5_allow_eighths": True,
+    },
     # 各类发现的严重级别，可被教师覆盖
     "severity": {
         "voice_crossing": "error",
@@ -130,6 +144,17 @@ DEFAULT_RULES: Dict[str, Any] = {
         "leap_too_large": "warning",
         "repeated_highest": "warning",
         "range_violation": "warning",
+        # 对位类别（species）专属发现
+        "species_note_count": "error",
+        "species_attack_position": "error",
+        "species_note_value": "error",
+        "species_tie_missing": "error",
+        "species_tie_unexpected": "warning",
+        "species5_rhythm_monotony": "warning",
+        "start_interval_imperfect": "error",
+        "final_interval_not_octave": "error",
+        "cadence_motion": "error",
+        "leading_tone": "error",
     },
 }
 
@@ -208,6 +233,19 @@ def validate_rules(rules: Any) -> List[str]:
                     if lo is not None and hi is not None:
                         if pitch_to_midi(str(lo)) > pitch_to_midi(str(hi)):
                             errors.append(f"melody.ranges.{voice}: low 高于 high")
+
+    sp = rules.get("species", {})
+    if isinstance(sp, dict):
+        for key in ("allow_first_measure_rest", "final_measure_whole_note",
+                    "penultimate_measure_flexible", "species5_require_mixed_values",
+                    "species5_allow_eighths"):
+            val = sp.get(key)
+            if val is not None and not isinstance(val, bool):
+                errors.append(f"species.{key} 必须是布尔值")
+        rest = sp.get("first_measure_rest_max_quarters")
+        if rest is not None and not (isinstance(rest, (int, float))
+                                     and not isinstance(rest, bool) and rest >= 0):
+            errors.append("species.first_measure_rest_max_quarters 必须是 >=0 的数")
 
     sev = rules.get("severity", {})
     if sev is not None and not isinstance(sev, dict):
@@ -395,6 +433,76 @@ def is_consonant(iv: Dict[str, Any], rules: Dict[str, Any]) -> bool:
 
 def is_perfect(iv: Dict[str, Any]) -> bool:
     return iv["simple_label"] in PERFECT_FAMILIES
+
+
+# ---------------------------------------------------------------------------
+# 调号与音级
+# ---------------------------------------------------------------------------
+
+#: 大调 / 自然小调音阶（相对主音的半音偏移，级数 1..7）
+_MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11]
+_NATURAL_MINOR_SCALE = [0, 2, 3, 5, 7, 8, 10]
+
+_MAJOR_NAMES = {0: "C", 1: "G", 2: "D", 3: "A", 4: "E", 5: "B", 6: "F#",
+                7: "C#", -1: "F", -2: "Bb", -3: "Eb", -4: "Ab", -5: "Db",
+                -6: "Gb", -7: "Cb"}
+_MINOR_NAMES = {0: "a", 1: "e", 2: "b", 3: "f#", 4: "c#", 5: "g#", 6: "d#",
+                7: "a#", -1: "d", -2: "g", -3: "c", -4: "f", -5: "bb",
+                -6: "eb", -7: "ab"}
+
+
+def is_minor_mode(mode: Optional[str]) -> bool:
+    return bool(mode) and str(mode).strip().lower().startswith("minor")
+
+
+def key_tonic_pc(fifths: int, mode: Optional[str] = None) -> int:
+    """调号 -> 主音音高类别（0=C … 11=B）。小调取关系小调主音。"""
+    base = (fifths * 7) % 12
+    if is_minor_mode(mode):
+        base = (base + 9) % 12
+    return base
+
+
+def key_label(key: Optional[Dict[str, Any]]) -> Optional[str]:
+    """调号可读标签，如 ``C 大调`` / ``a 小调``；无调号返回 None。"""
+    if not key:
+        return None
+    fifths = key.get("fifths")
+    if fifths is None:
+        return None
+    if is_minor_mode(key.get("mode")):
+        name = _MINOR_NAMES.get(fifths, f"{fifths:+d}")
+        return f"{name} 小调"
+    name = _MAJOR_NAMES.get(fifths, f"{fifths:+d}")
+    return f"{name} 大调"
+
+
+def scale_degree(pitch: Dict[str, Any], key: Optional[Dict[str, Any]]
+                 ) -> Optional[Tuple[int, int]]:
+    """音高在调内的音级。返回 ``(级数 1-7, 变化半音)``，无法确定调时返回 None。
+
+    变化半音：0=自然级，+1=升高半音（如小调导音 #7），-1=降低半音。
+    """
+    if not key or key.get("fifths") is None:
+        return None
+    tonic = key_tonic_pc(key["fifths"], key.get("mode"))
+    scale = _NATURAL_MINOR_SCALE if is_minor_mode(key.get("mode")) else _MAJOR_SCALE
+    rel = (pitch["midi"] - tonic) % 12
+    for idx, semi in enumerate(scale):
+        if rel == semi:
+            return (idx + 1, 0)
+    for idx, semi in enumerate(scale):
+        if rel == (semi + 1) % 12:
+            return (idx + 1, 1)
+        if rel == (semi - 1) % 12:
+            return (idx + 1, -1)
+    return None
+
+
+def degree_label(degree: int, alter: int = 0) -> str:
+    """音级标签：``1``、``#7``、``b3``。"""
+    prefix = "#" * alter if alter > 0 else ("b" * (-alter) if alter < 0 else "")
+    return f"{prefix}{degree}"
 
 
 # ---------------------------------------------------------------------------

@@ -267,6 +267,17 @@ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding
 <li><a href="/samples/bad_exercise_revised.musicxml">bad_exercise_revised.musicxml</a> 上一谱的修订版</li>
 <li><a href="/samples/broken_notation.musicxml">broken_notation.musicxml</a> 无法分析的记谱（多声部混写/时值缺失）</li>
 </ul>
+<h2>五类对位示例（定旋律在低声部，2/2 拍）</h2>
+<ul>
+<li><a href="/samples/species1.musicxml">species1.musicxml</a> 第一类：一音对一音</li>
+<li><a href="/samples/species2.musicxml">species2.musicxml</a> 第二类：二音对一音（首小节半休止）</li>
+<li><a href="/samples/species3.musicxml">species3.musicxml</a> 第三类：四音对一音</li>
+<li><a href="/samples/species4.musicxml">species4.musicxml</a> 第四类：切分延留</li>
+<li><a href="/samples/species5.musicxml">species5.musicxml</a> 第五类：混合节奏</li>
+</ul>
+<p>创建分析时指定 <code>{{"species": 1, "cantus": "lower"}}</code>
+即按类别校验；类别非法、定旋律声部不存在会返回 400，谱面节奏无法满足
+类别时逐小节/音符报出 <code>species_*</code> 发现，系统不擅自改类。</p>
 </body></html>"""
     h._send_html(html)
 
@@ -355,6 +366,7 @@ def h_list_analyses(h, db, query):
         out.append({
             "id": r["id"], "score_id": r["score_id"],
             "rule_set_id": r["rule_set_id"], "status": r["status"],
+            "species": r["species"], "cantus_part": r["cantus_part"],
             "summary": json.loads(r["summary_json"]),
             "created_at": r["created_at"],
         })
@@ -367,7 +379,14 @@ def h_get_analysis(h, db, query, rid):
 
 def h_findings(h, db, query, rid):
     findings = service.list_findings(db, rid, query)
-    h._send_json({"analysis_id": rid, "count": len(findings),
+    meta = service.analysis_dict(db, rid)
+    h._send_json({"analysis_id": rid,
+                  "species": meta["species"],
+                  "species_name": meta["species_name"],
+                  "cantus_part": meta["cantus_part"],
+                  "cantus_role": meta["cantus_role"],
+                  "rule_version": meta["rule_version"],
+                  "count": len(findings),
                   "findings": findings})
 
 

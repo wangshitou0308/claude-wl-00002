@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS analyses (
     rule_set_id INTEGER NOT NULL REFERENCES rule_sets(id),
     rules_snapshot TEXT NOT NULL,      -- 分析时冻结的规则 JSON
     status TEXT NOT NULL,              -- ok / parse_error
+    species INTEGER,                   -- 对位类别 1-5（未指定为 NULL）
+    cantus_part TEXT,                  -- 定旋律声部 part_id
     parse_issues_json TEXT NOT NULL,   -- 解析期问题（error/warning）
     summary_json TEXT NOT NULL,        -- {total, by_kind, by_severity}
     created_at TEXT NOT NULL
@@ -122,7 +124,16 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """老库补列：analyses 增加对位类别与定旋律声部。"""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(analyses)")}
+        if "species" not in cols:
+            self.conn.execute("ALTER TABLE analyses ADD COLUMN species INTEGER")
+        if "cantus_part" not in cols:
+            self.conn.execute("ALTER TABLE analyses ADD COLUMN cantus_part TEXT")
 
     def close(self) -> None:
         # 共享内存连接由进程持有，单次 close 不真正关闭
@@ -228,12 +239,16 @@ class Database:
                         rules_snapshot: Dict[str, Any], status: str,
                         parse_issues: List[Dict[str, Any]],
                         findings: List[Dict[str, Any]],
-                        summary: Dict[str, Any]) -> int:
+                        summary: Dict[str, Any],
+                        species: Optional[int] = None,
+                        cantus_part: Optional[str] = None) -> int:
         cur = self.conn.execute(
             "INSERT INTO analyses (score_id, rule_set_id, rules_snapshot, status, "
-            "parse_issues_json, summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "species, cantus_part, parse_issues_json, summary_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (score_id, rule_set_id,
              json.dumps(rules_snapshot, ensure_ascii=False), status,
+             species, cantus_part,
              json.dumps(parse_issues, ensure_ascii=False),
              json.dumps(summary, ensure_ascii=False), utc_now()))
         analysis_id = int(cur.lastrowid)

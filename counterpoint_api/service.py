@@ -8,6 +8,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import counterpoint, musicxml_io, rulesconfig as rc
+from .species import SPECIES_NAMES, VALID_SPECIES
 from .storage import Database
 
 
@@ -128,19 +129,59 @@ def create_analysis(db: Database, payload: Dict[str, Any]) -> Dict[str, Any]:
     rules = json.loads(rs_row["rules_json"])
 
     parsed = musicxml_io.parse_score(score_row["xml"].encode("utf-8"))
+
+    # ---- 对位类别与定旋律声部（教师创建分析时指定；不擅自改类）----------
+    species, cantus_role, cantus_part = _resolve_species(payload, parsed)
     status = "parse_error" if parsed["fatal"] else "ok"
 
     findings: List[Dict[str, Any]] = []
     if not parsed["fatal"]:
-        result = counterpoint.analyze(parsed, rules)
+        result = counterpoint.analyze(parsed, rules, species=species,
+                                      cantus_role=cantus_role)
         findings = result["findings"]
 
     summary = _summarize(findings, parsed["parse_issues"])
     analysis_id = db.insert_analysis(
         score_row["id"], rs_row["id"], rules, status,
-        parsed["parse_issues"], findings, summary)
+        parsed["parse_issues"], findings, summary,
+        species=species, cantus_part=cantus_part)
 
     return analysis_dict(db, analysis_id, include_findings=True)
+
+
+def _resolve_species(payload: Dict[str, Any], parsed: Dict[str, Any]
+                     ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """解析并校验 species / cantus 参数。
+
+    返回 ``(species, cantus_role, cantus_part)``；未指定时为全 None。
+    类别非法、定旋律声部不存在、只给其一，均抛 400——绝不擅自改类。
+    """
+    species = payload.get("species")
+    cantus = payload.get("cantus", payload.get("cantus_part"))
+    if species is None and cantus is None:
+        return None, None, None
+    if species is None or cantus is None:
+        raise ServiceError(
+            400, "请同时指定对位类别 species（1–5）与定旋律声部 cantus"
+                 "（upper / lower / part_id）")
+    if isinstance(species, bool) or not isinstance(species, int) \
+            or species not in VALID_SPECIES:
+        raise ServiceError(
+            400, f"对位类别非法：{species!r}；类别必须是 1–5 的整数："
+                 + "、".join(f"{k}={v}" for k, v in SPECIES_NAMES.items()))
+    part_ids = parsed["part_ids"]
+    roles = parsed["roles"]
+    if cantus in ("upper", "lower"):
+        cantus_role = cantus
+        cantus_part = next(pid for pid, r in roles.items() if r == cantus)
+    elif cantus in part_ids:
+        cantus_part = cantus
+        cantus_role = roles[cantus]
+    else:
+        raise ServiceError(
+            400, f"定旋律声部不存在：{cantus!r}；本谱声部为 {part_ids}"
+                 f"（upper={part_ids[0]}，lower={part_ids[1]}）")
+    return species, cantus_role, cantus_part
 
 
 def _summarize(findings: List[Dict[str, Any]],
@@ -173,6 +214,10 @@ def analysis_dict(db: Database, analysis_id: int,
         "rule_set_id": row["rule_set_id"],
         "rule_set_name": rs["name"] if rs else None,
         "rule_version": row["rules_snapshot"] and json.loads(row["rules_snapshot"]).get("version"),
+        "species": row["species"],
+        "species_name": SPECIES_NAMES.get(row["species"]) if row["species"] else None,
+        "cantus_part": row["cantus_part"],
+        "cantus_role": _cantus_role(score, row["cantus_part"]),
         "status": row["status"],
         "parse_issues": json.loads(row["parse_issues_json"]),
         "summary": json.loads(row["summary_json"]),
@@ -182,6 +227,18 @@ def analysis_dict(db: Database, analysis_id: int,
         rows = db.query_findings(analysis_id)
         out["findings"] = [finding_dict(db, r) for r in rows]
     return out
+
+
+def _cantus_role(score_row: Optional[sqlite3.Row],
+                 cantus_part: Optional[str]) -> Optional[str]:
+    if score_row is None or not cantus_part:
+        return None
+    part_ids = json.loads(score_row["part_ids"])
+    if part_ids and part_ids[0] == cantus_part:
+        return "upper"
+    if len(part_ids) > 1 and part_ids[1] == cantus_part:
+        return "lower"
+    return None
 
 
 def finding_dict(db: Database, row: sqlite3.Row) -> Dict[str, Any]:
@@ -289,6 +346,16 @@ KIND_LABELS_ZH = {
     "leap_too_large": "超过最大跳进",
     "repeated_highest": "重复最高音",
     "range_violation": "音域越界",
+    "species_note_count": "对位音数量与类别不符",
+    "species_attack_position": "起音位置与类别不符",
+    "species_note_value": "音符时值与类别不符",
+    "species_tie_missing": "第四类缺少切分延音",
+    "species_tie_unexpected": "第四类强拍新起音",
+    "species5_rhythm_monotony": "第五类节奏不混合",
+    "start_interval_imperfect": "起始非完全协和",
+    "final_interval_not_octave": "终止非一度/八度",
+    "cadence_motion": "终止进行非反向级进",
+    "leading_tone": "导音处理不当",
 }
 
 
@@ -327,6 +394,10 @@ def compare_analyses(db: Database, base_id: int, revised_id: int,
         "revised_analysis_id": revised_id,
         "base_score_id": base["score_id"],
         "revised_score_id": revised["score_id"],
+        "context": {
+            "base": _analysis_context(base),
+            "revised": _analysis_context(revised),
+        },
         "counts": {
             "base_total": len(base_rows),
             "revised_total": len(rev_rows),
@@ -344,6 +415,17 @@ def compare_analyses(db: Database, base_id: int, revised_id: int,
         cid = db.insert_comparison(base_id, revised_id, result)
         result["id"] = cid
     return result
+
+
+def _analysis_context(row: sqlite3.Row) -> Dict[str, Any]:
+    """比对结果中保留的课型参数：类别、定旋律声部与规则版本。"""
+    snapshot = json.loads(row["rules_snapshot"]) if row["rules_snapshot"] else {}
+    return {
+        "species": row["species"],
+        "species_name": SPECIES_NAMES.get(row["species"]) if row["species"] else None,
+        "cantus_part": row["cantus_part"],
+        "rule_version": snapshot.get("version"),
+    }
 
 
 def comparison_dict(row: sqlite3.Row) -> Dict[str, Any]:

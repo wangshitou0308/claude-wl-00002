@@ -108,14 +108,15 @@ def measure_xml(number, tokens, time_sig=(4, 4), key_fifths=0,
     return "".join(out)
 
 
-def part_xml(part_id, measures, clef="G"):
+def part_xml(part_id, measures_list, clef="G", time_sig=(4, 4)):
     body = []
-    for i, tokens in enumerate(measures, start=1):
-        body.append(measure_xml(i, tokens, first=(i == 1), clef=clef))
+    for i, tokens in enumerate(measures_list, start=1):
+        body.append(measure_xml(i, tokens, first=(i == 1), clef=clef,
+                                time_sig=time_sig))
     return f'  <part id="{part_id}">\n' + "".join(body) + "  </part>\n"
 
 
-def document(title, upper_measures, lower_measures):
+def document(title, upper_measures, lower_measures, time_sig=(4, 4)):
     header = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN"
   "http://www.musicxml.org/dtds/partwise.dtd">
@@ -126,8 +127,8 @@ def document(title, upper_measures, lower_measures):
     <score-part id="P2"><part-name>Bass</part-name></score-part>
   </part-list>
 """
-    body = part_xml("P1", upper_measures, clef="G")
-    body += part_xml("P2", lower_measures, clef="F")
+    body = part_xml("P1", upper_measures, clef="G", time_sig=time_sig)
+    body += part_xml("P2", lower_measures, clef="F", time_sig=time_sig)
     return header + body + "</score-partwise>\n"
 
 
