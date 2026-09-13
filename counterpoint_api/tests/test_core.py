@@ -382,6 +382,205 @@ def make_quarter_case(lower_whole, upper_q):
     return build_doc(upper_measures, lower_measures)
 
 
+class TestSpecies(unittest.TestCase):
+    """第一至第五类对位校验。"""
+
+    RULES = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.RULES = rc.build_rules()
+
+    def analyze_sample(self, name, species, cantus="lower", rules=None):
+        parsed = musicxml_io.parse_score(read_sample(name))
+        self.assertFalse(parsed["fatal"],
+                         [i["message"] for i in parsed["parse_issues"]])
+        return counterpoint.analyze(parsed, rules or self.RULES,
+                                    species=species, cantus_role=cantus)
+
+    def test_five_species_samples_are_clean(self):
+        """五类示例谱在各自类别 + 默认规则下均为 0 条发现。"""
+        for sp in (1, 2, 3, 4, 5):
+            result = self.analyze_sample(f"species{sp}.musicxml", sp)
+            self.assertEqual(
+                [(f["kind"], f["measure"], f["message"]) for f in result["findings"]],
+                [], f"species{sp} 应 0 发现")
+
+    def test_wrong_species_not_reclassified(self):
+        """第一类谱按第三类校验：逐小节奏出 species_* 发现且不擅自改类。"""
+        parsed = musicxml_io.parse_score(read_sample("species1.musicxml"))
+        result = counterpoint.analyze(parsed, self.RULES, species=3,
+                                      cantus_role="lower")
+        species_findings = [f for f in result["findings"]
+                            if f["kind"].startswith("species_")]
+        self.assertTrue(species_findings, "应报出类别不符的发现")
+        kinds = {f["kind"] for f in species_findings}
+        self.assertIn("species_note_count", kinds)
+        self.assertIn("species_attack_position", kinds)
+        for f in species_findings:
+            self.assertIsInstance(f["measure"], int)
+            self.assertTrue(f["notes"], "发现应定位到具体音符")
+            self.assertEqual(f["trace"]["species"], 3)
+            self.assertEqual(f["trace"]["rhythm_ratio"]["expected"], "4:1")
+
+    def test_scale_degree_follows_spelling(self):
+        """音级按谱面拼写与调式计算。"""
+        key_c = {"fifths": 0, "mode": "major"}
+        key_am = {"fifths": 0, "mode": "minor"}
+
+        def deg(name, key):
+            return rc.scale_degree(rc.parse_pitch_name(name), key)
+
+        self.assertEqual(deg("Db4", key_c), (2, -1))   # b2 而非 #1
+        self.assertEqual(deg("Bb4", key_c), (7, -1))   # b7 而非 #6
+        self.assertEqual(deg("C#4", key_c), (1, 1))
+        self.assertEqual(deg("G#4", key_am), (7, 1))   # 小调导音 #7
+        self.assertEqual(deg("G4", key_am), (7, 0))    # 自然七级（下主音）
+        self.assertEqual(deg("F#4", key_am), (6, 1))
+        self.assertEqual(rc.degree_label(*deg("Db4", key_c)), "b2")
+        self.assertEqual(rc.degree_label(*deg("G#4", key_am)), "#7")
+
+    def test_leading_tone_minor_unresolved(self):
+        """A 小调：导音 G# 未上行解决到主音时报 leading_tone。"""
+        from counterpoint_api.samples_helper import build_doc
+        xml = build_doc(
+            [[("E4", "w")], [("D4", "w")], [("E4", "w")], [("G#4", "w")],
+             [("E4", "w")]],
+            [[("A2", "w")], [("B2", "w")], [("C3", "w")], [("B2", "w")],
+             [("A2", "w")]],
+            key_mode="minor")
+        parsed = musicxml_io.parse_score(xml)
+        self.assertFalse(parsed["fatal"],
+                         [i["message"] for i in parsed["parse_issues"]])
+        result = counterpoint.analyze(parsed, self.RULES, species=1,
+                                      cantus_role="lower")
+        lt = [f for f in result["findings"] if f["kind"] == "leading_tone"]
+        self.assertTrue(lt, "G# 未解决到主音应报导音问题")
+        self.assertIn("未级进上行解决到主音", lt[0]["message"])
+        self.assertEqual(lt[0]["trace"]["scale_degrees"]["penultimate"], "#7")
+
+    def test_leading_tone_minor_not_raised(self):
+        """A 小调终止处用自然七级 G（未升高）时报 leading_tone。"""
+        from counterpoint_api.samples_helper import build_doc
+        xml = build_doc(
+            [[("E4", "w")], [("D4", "w")], [("E4", "w")], [("G4", "w")],
+             [("A4", "w")]],
+            [[("A2", "w")], [("B2", "w")], [("C3", "w")], [("B2", "w")],
+             [("A2", "w")]],
+            key_mode="minor")
+        parsed = musicxml_io.parse_score(xml)
+        result = counterpoint.analyze(parsed, self.RULES, species=1,
+                                      cantus_role="lower")
+        lt = [f for f in result["findings"] if f["kind"] == "leading_tone"]
+        self.assertTrue(lt, "自然七级应报未升高")
+        self.assertIn("未升高", lt[0]["message"])
+
+    def test_leading_tone_minor_resolved_ok(self):
+        """A 小调：G# 级进上行到 A 时不报导音问题。"""
+        from counterpoint_api.samples_helper import build_doc
+        xml = build_doc(
+            [[("E4", "w")], [("D4", "w")], [("E4", "w")], [("G#4", "w")],
+             [("A4", "w")]],
+            [[("A2", "w")], [("B2", "w")], [("C3", "w")], [("B2", "w")],
+             [("A2", "w")]],
+            key_mode="minor")
+        parsed = musicxml_io.parse_score(xml)
+        result = counterpoint.analyze(parsed, self.RULES, species=1,
+                                      cantus_role="lower")
+        self.assertFalse(any(f["kind"] == "leading_tone"
+                             for f in result["findings"]),
+                         [f["message"] for f in result["findings"]])
+
+    def test_cadence_and_final_interval(self):
+        """终止非八度、终止进行非反向级进分别报出。"""
+        from counterpoint_api.samples_helper import build_doc
+        # 终止为五度（E4/A2），且对位三度跳进收束
+        xml = build_doc(
+            [[("E4", "w")], [("D4", "w")], [("E4", "w")], [("G4", "w")],
+             [("E4", "w")]],
+            [[("C3", "w")], [("D3", "w")], [("E3", "w")], [("D3", "w")],
+             [("A2", "w")]])
+        parsed = musicxml_io.parse_score(xml)
+        result = counterpoint.analyze(parsed, self.RULES, species=1,
+                                      cantus_role="lower")
+        kinds = {f["kind"] for f in result["findings"]}
+        self.assertIn("final_interval_not_octave", kinds)
+        self.assertIn("cadence_motion", kinds)
+
+    def test_cantus_upper_voice(self):
+        """定旋律在上声部时，对位在下方不可用五度起始。"""
+        result = self.analyze_sample("species1.musicxml", 1, cantus="upper")
+        kinds = {f["kind"] for f in result["findings"]}
+        self.assertIn("start_interval_imperfect", kinds)
+
+    def test_species4_missing_tie(self):
+        """第四类弱位起音未系延音时报 species_tie_missing 并定位。"""
+        from counterpoint_api.samples_helper import build_doc
+        xml = build_doc(
+            [[("r", "h"), ("G4", "h", {"tie": "start"})],
+             [("G4", "h", {"tie": "stop"}), ("F4", "h")],   # m2 弱位缺延音
+             [("F4", "h", {"tie": "start"}), ("A4", "h", {"tie": "start"})],
+             [("A4", "h", {"tie": "stop"}), ("B4", "h")],
+             [("C5", "w")]],
+            [[("C3", "w")], [("D3", "w")], [("F3", "w")], [("D3", "w")],
+             [("C3", "w")]],
+            time_sig=(2, 2))
+        parsed = musicxml_io.parse_score(xml)
+        self.assertFalse(parsed["fatal"],
+                         [i["message"] for i in parsed["parse_issues"]])
+        result = counterpoint.analyze(parsed, self.RULES, species=4,
+                                      cantus_role="lower")
+        ties = [f for f in result["findings"]
+                if f["kind"] == "species_tie_missing"]
+        self.assertTrue(ties, "缺延音应报出")
+        self.assertEqual(ties[0]["measure"], 2)
+        self.assertTrue(ties[0]["notes"])
+
+    def test_species5_requires_mixed_values(self):
+        """第五类只用一种时值时报 species5_rhythm_monotony。"""
+        from counterpoint_api.samples_helper import build_doc
+        xml = build_doc(
+            [[("r", "h"), ("G4", "h")],
+             [("F4", "h"), ("G4", "h")],
+             [("C5", "w")]],
+            [[("C3", "w")], [("D3", "w")], [("C3", "w")]],
+            time_sig=(2, 2))
+        parsed = musicxml_io.parse_score(xml)
+        result = counterpoint.analyze(parsed, self.RULES, species=5,
+                                      cantus_role="lower")
+        self.assertTrue(any(f["kind"] == "species5_rhythm_monotony"
+                            for f in result["findings"]),
+                        [f["message"] for f in result["findings"]])
+
+    def test_first_measure_rest_exception_configurable(self):
+        """首小节休止例外可由规则集关闭。"""
+        strict = rc.build_rules({"species": {"allow_first_measure_rest": False}})
+        result = self.analyze_sample("species2.musicxml", 2, rules=strict)
+        self.assertTrue(any(f["kind"] == "species_attack_position"
+                            and f["measure"] == 1
+                            for f in result["findings"]),
+                        "关闭首小节休止例外后应报第 1 小节起音位置")
+
+    def test_every_finding_has_judgment_fields(self):
+        """每条发现都带音级、纵向音程、节奏比例与判定轨迹。"""
+        result = self.analyze_sample("bad_exercise.musicxml", 1)
+        self.assertTrue(result["findings"])
+        for f in result["findings"]:
+            self.assertIn("scale_degrees", f["trace"], f["kind"])
+            self.assertIn("vertical_interval", f["trace"], f["kind"])
+            self.assertIn("rhythm_ratio", f["trace"], f["kind"])
+            self.assertIsNotNone(f["trace"]["scale_degrees"], f["kind"])
+            self.assertIsNotNone(f["trace"]["vertical_interval"], f["kind"])
+            self.assertIsNotNone(f["trace"]["rhythm_ratio"]["actual"],
+                                 f["kind"])
+        # 单声部类发现（音域/重复最高音/大跳）也必须补出纵向音程
+        for kind in ("range_violation", "repeated_highest", "leap_too_large"):
+            for f in result["findings"]:
+                if f["kind"] == kind:
+                    self.assertIsNotNone(f["trace"]["vertical_interval"],
+                                         f"{kind} 缺纵向音程")
+
+
 class TestStorageAndService(unittest.TestCase):
     def setUp(self):
         self.db = Database(":memory:")
@@ -396,10 +595,17 @@ class TestStorageAndService(unittest.TestCase):
                                    read_sample("bad_exercise.musicxml").decode())
         revised = service.upload_score(self.db,
                                        read_sample("bad_exercise_revised.musicxml").decode())
-        a1 = service.create_analysis(self.db, {"score_id": bad["id"]})
-        a2 = service.create_analysis(self.db, {"score_id": revised["id"]})
+        a1 = service.create_analysis(self.db, {"score_id": bad["id"],
+                                               "species": 1, "cantus": "lower"})
+        a2 = service.create_analysis(self.db, {"score_id": revised["id"],
+                                               "species": 1, "cantus": "lower"})
         self.assertEqual(a1["status"], "ok")
         self.assertTrue(a1["summary"]["total"] > 0)
+        # 课型参数随分析保存
+        self.assertEqual(a1["species"], 1)
+        self.assertEqual(a1["cantus_part"], "P2")
+        self.assertEqual(a1["cantus_role"], "lower")
+        self.assertTrue(a1["rule_version"])
 
         # 筛选
         only_p5 = service.list_findings(self.db, a1["id"], {"kind": ["parallel_fifth"]})
@@ -439,10 +645,38 @@ class TestStorageAndService(unittest.TestCase):
     def test_broken_score_analysis_is_parse_error(self):
         up = service.upload_score(self.db,
                                   read_sample("broken_notation.musicxml").decode())
-        analysis = service.create_analysis(self.db, {"score_id": up["id"]})
+        analysis = service.create_analysis(self.db, {"score_id": up["id"],
+                                                     "species": 1,
+                                                     "cantus": "lower"})
         self.assertEqual(analysis["status"], "parse_error")
         self.assertTrue(any(i["severity"] == "error"
                             for i in analysis["parse_issues"]))
+
+    def test_species_and_cantus_required(self):
+        good = service.upload_score(self.db,
+                                    read_sample("species1.musicxml").decode())
+        # 两个参数都缺失
+        with self.assertRaises(service.ServiceError) as cm:
+            service.create_analysis(self.db, {"score_id": good["id"]})
+        self.assertEqual(cm.exception.status, 400)
+        # 只给其一
+        with self.assertRaises(service.ServiceError):
+            service.create_analysis(self.db, {"score_id": good["id"],
+                                              "species": 1})
+        with self.assertRaises(service.ServiceError):
+            service.create_analysis(self.db, {"score_id": good["id"],
+                                              "cantus": "lower"})
+        # 类别非法
+        for bad in (0, 6, "1", True):
+            with self.assertRaises(service.ServiceError):
+                service.create_analysis(self.db, {"score_id": good["id"],
+                                                  "species": bad,
+                                                  "cantus": "lower"})
+        # 定旋律声部不存在
+        with self.assertRaises(service.ServiceError) as cm2:
+            service.create_analysis(self.db, {"score_id": good["id"],
+                                              "species": 1, "cantus": "P9"})
+        self.assertIn("定旋律声部不存在", cm2.exception.message)
 
     def test_rule_copy_creates_version(self):
         rid = service.ensure_default_rule_set(self.db)

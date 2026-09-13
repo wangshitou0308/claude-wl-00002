@@ -385,8 +385,16 @@ def _check_species5_variety(ctx: Dict[str, Any], rules: Dict[str, Any],
                             cf_segments: List[Dict[str, Any]],
                             cp_line: Dict[str, Any], cp_role: str,
                             cantus_role: str) -> List[Dict[str, Any]]:
-    """第五类要求全曲混合至少两种时值。"""
-    durations = {round(a["end"] - a["start"], 6) for a in cp_line["attacks"]}
+    """第五类要求全曲混合至少两种时值（终止小节的全音符收束不计入）。"""
+    cfg = rules.get("species", {})
+    final_start = None
+    if cfg.get("final_measure_whole_note", True) and cf_segments:
+        final_start = cf_segments[-1]["start"]
+    durations = {
+        round(a["end"] - a["start"], 6)
+        for a in cp_line["attacks"]
+        if final_start is None or a["start"] < final_start - EPS
+    }
     if len(durations) >= 2 or not cp_line["attacks"]:
         return []
     first = cp_line["attacks"][0]

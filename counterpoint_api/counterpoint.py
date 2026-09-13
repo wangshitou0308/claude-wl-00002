@@ -137,6 +137,10 @@ def _enrich_trace(finding: Dict[str, Any], ctx: Dict[str, Any]) -> None:
                         pitches[role] = pitch
             if "upper" in pitches and "lower" in pitches:
                 iv = rc.interval_info(pitches["lower"], pitches["upper"])["label"]
+        if iv is None:
+            # 单声部类发现（音域、重复最高音、大跳等）：按发现所在拍点
+            # 取两声部当时的发声片段计算纵向音程
+            iv = _interval_at_time(ctx, finding.get("time"))
         trace["vertical_interval"] = iv
 
     # ---- 节奏比例 -------------------------------------------------------
@@ -173,6 +177,17 @@ def _actual_ratio(ctx: Dict[str, Any], t: Optional[float]) -> Optional[str]:
         return None
     ratio = d1 / d2
     return f"{ratio.numerator}:{ratio.denominator}"
+
+
+def _interval_at_time(ctx: Dict[str, Any], t: Optional[float]) -> Optional[str]:
+    """t 时刻两声部实际发声音构成的纵向音程标签（低声部→高声部）。"""
+    if t is None:
+        return None
+    up = _sounding(ctx["lines"]["upper"], t)
+    lo = _sounding(ctx["lines"]["lower"], t)
+    if up is None or lo is None:
+        return None
+    return rc.interval_info(lo["pitch"], up["pitch"])["label"]
 
 
 # ---------------------------------------------------------------------------

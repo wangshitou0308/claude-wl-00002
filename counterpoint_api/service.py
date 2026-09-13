@@ -157,7 +157,7 @@ def _resolve_species(payload: Dict[str, Any], parsed: Dict[str, Any]
     不存在、参数缺失，均抛 400——绝不擅自改类或默认猜测。
     """
     species = payload.get("species")
-    cantus = payload.get("cantus", payload.get("cantus_part"))
+    cantus = payload.get("cantus")
     missing = []
     if species is None:
         missing.append("species（对位类别 1–5）")

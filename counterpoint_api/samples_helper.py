@@ -50,31 +50,38 @@ def _note(token):
     return "".join(lines)
 
 
-def _measure(number, tokens, attrs=False, clef="G"):
+def _measure(number, tokens, attrs=False, clef="G", time_sig=(4, 4),
+             key_fifths=0, key_mode="major"):
     out = [f'  <measure number="{number}">\n']
     if attrs:
         out.append("""    <attributes>
       <divisions>2</divisions>
-      <key><fifths>0</fifths><mode>major</mode></key>
-      <time><beats>4</beats><beat-type>4</beat-type></time>
+      <key><fifths>%d</fifths><mode>%s</mode></key>
+      <time><beats>%d</beats><beat-type>%d</beat-type></time>
       <clef><sign>%s</sign><line>%s</line></clef>
     </attributes>
-""" % (clef, 2 if clef == "G" else 4))
+""" % (key_fifths, key_mode, time_sig[0], time_sig[1],
+            clef, 2 if clef == "G" else 4))
     for tok in tokens:
         out.append(_note(tok))
     out.append("  </measure>\n")
     return "".join(out)
 
 
-def build_doc(upper_measures, lower_measures):
+def build_doc(upper_measures, lower_measures, time_sig=(4, 4),
+              key_fifths=0, key_mode="major"):
     parts = []
     for i, tokens in enumerate(upper_measures, start=1):
-        parts.append(_measure(i, tokens, attrs=(i == 1), clef="G"))
+        parts.append(_measure(i, tokens, attrs=(i == 1), clef="G",
+                              time_sig=time_sig, key_fifths=key_fifths,
+                              key_mode=key_mode))
     p1 = '  <part id="P1">\n' + "".join(parts) + "  </part>\n"
 
     parts = []
     for i, tokens in enumerate(lower_measures, start=1):
-        parts.append(_measure(i, tokens, attrs=(i == 1), clef="F"))
+        parts.append(_measure(i, tokens, attrs=(i == 1), clef="F",
+                              time_sig=time_sig, key_fifths=key_fifths,
+                              key_mode=key_mode))
     p2 = '  <part id="P2">\n' + "".join(parts) + "  </part>\n"
 
     return ("""<?xml version="1.0" encoding="UTF-8"?>

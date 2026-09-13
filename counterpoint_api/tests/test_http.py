@@ -84,24 +84,35 @@ class TestHTTPApi(unittest.TestCase):
 
     def test_full_workflow_over_http(self):
         with ServerHarness() as srv:
-            # 上传干净谱（原始 XML 文本）
+            # 上传干净的第一类作业（原始 XML 文本）
             status, _, body = srv.request(
                 "/api/scores", method="POST",
-                raw=read_sample("good_exercise.musicxml"),
+                raw=read_sample("species1.musicxml"),
                 ctype="application/xml")
             self.assertEqual(status, 201, body)
             good_id = json.loads(body)["id"]
             self.assertFalse(json.loads(body)["fatal"])
 
-            # 分析，应为 0 发现
+            # 不带 species/cantus 创建分析：400
             status, _, body = srv.request("/api/analyses", "POST",
                                           {"score_id": good_id})
-            self.assertEqual(status, 201)
+            self.assertEqual(status, 400)
+            self.assertIn("species", json.loads(body)["error"])
+
+            # 指定第一类 + 定旋律在低声部，应为 0 发现
+            status, _, body = srv.request("/api/analyses", "POST",
+                                          {"score_id": good_id, "species": 1,
+                                           "cantus": "lower"})
+            self.assertEqual(status, 201, body)
             good_analysis = json.loads(body)
             self.assertEqual(good_analysis["status"], "ok")
             self.assertEqual(good_analysis["summary"]["total"], 0)
+            self.assertEqual(good_analysis["species"], 1)
+            self.assertEqual(good_analysis["cantus_part"], "P2")
+            self.assertEqual(good_analysis["cantus_role"], "lower")
+            self.assertTrue(good_analysis["rule_version"])
 
-            # 问题谱与修订版
+            # 问题谱与修订版（自由对位谱，按第一类校验）
             bad_id = json.loads(srv.request(
                 "/api/scores", "POST", raw=read_sample("bad_exercise.musicxml"),
                 ctype="application/xml")[2])["id"]
@@ -110,23 +121,36 @@ class TestHTTPApi(unittest.TestCase):
                 raw=read_sample("bad_exercise_revised.musicxml"),
                 ctype="application/xml")[2])["id"]
             bad_a = json.loads(srv.request(
-                "/api/analyses", "POST", {"score_id": bad_id})[2])
+                "/api/analyses", "POST", {"score_id": bad_id, "species": 1,
+                                          "cantus": "lower"})[2])
             rev_a = json.loads(srv.request(
-                "/api/analyses", "POST", {"score_id": rev_id})[2])
+                "/api/analyses", "POST", {"score_id": rev_id, "species": 1,
+                                          "cantus": "lower"})[2])
             self.assertGreater(bad_a["summary"]["total"], 0)
 
             # 筛选 error
             status, _, body = srv.request(
                 f"/api/analyses/{bad_a['id']}/findings?severity=error")
-            findings = json.loads(body)["findings"]
+            payload = json.loads(body)
+            findings = payload["findings"]
             self.assertTrue(findings)
             self.assertTrue(all(f["severity"] == "error" for f in findings))
+            # 发现筛选响应保留类别、定旋律与规则版本
+            self.assertEqual(payload["species"], 1)
+            self.assertEqual(payload["cantus_part"], "P2")
+            self.assertTrue(payload["rule_version"])
 
             # 筛选上声部
             status, _, body = srv.request(
                 f"/api/analyses/{bad_a['id']}/findings?role=upper")
             for f in json.loads(body)["findings"]:
                 self.assertTrue(any(n["part_id"] == "P1" for n in f["notes"]))
+
+            # 每条发现都带音级、纵向音程、节奏比例
+            for f in findings:
+                self.assertIn("scale_degrees", f["trace"])
+                self.assertIn("vertical_interval", f["trace"])
+                self.assertIn("rhythm_ratio", f["trace"])
 
             # 裁定
             fid = findings[0]["id"]
@@ -153,6 +177,11 @@ class TestHTTPApi(unittest.TestCase):
             self.assertEqual(
                 cmp_["counts"]["added"] + cmp_["counts"]["unchanged"],
                 cmp_["counts"]["revised_total"])
+            # 比较结果保留两版的类别、定旋律与规则版本
+            self.assertEqual(cmp_["context"]["base"]["species"], 1)
+            self.assertEqual(cmp_["context"]["base"]["cantus_part"], "P2")
+            self.assertTrue(cmp_["context"]["base"]["rule_version"])
+            self.assertEqual(cmp_["context"]["revised"]["species"], 1)
 
             # 下载
             status, ctype, body = srv.request(
@@ -162,6 +191,39 @@ class TestHTTPApi(unittest.TestCase):
             exported = json.loads(body)
             self.assertIn("rules_version", exported)
             self.assertEqual(len(exported["verdicts"]), 1)
+            self.assertEqual(exported["analysis"]["species"], 1)
+            self.assertEqual(exported["analysis"]["cantus_part"], "P2")
+
+    def test_species_params_validated(self):
+        with ServerHarness() as srv:
+            score_id = json.loads(srv.request(
+                "/api/scores", "POST", raw=read_sample("species2.musicxml"),
+                ctype="application/xml")[2])["id"]
+            # 缺 cantus
+            status, _, body = srv.request("/api/analyses", "POST",
+                                          {"score_id": score_id, "species": 2})
+            self.assertEqual(status, 400)
+            # 类别非法
+            for bad_species in (0, 6, "二"):
+                status, _, body = srv.request(
+                    "/api/analyses", "POST",
+                    {"score_id": score_id, "species": bad_species,
+                     "cantus": "lower"})
+                self.assertEqual(status, 400, f"species={bad_species!r} 应 400")
+            # 定旋律声部不存在
+            status, _, body = srv.request(
+                "/api/analyses", "POST",
+                {"score_id": score_id, "species": 2, "cantus": "P9"})
+            self.assertEqual(status, 400)
+            self.assertIn("定旋律声部不存在", json.loads(body)["error"])
+            # cantus 也接受 part_id
+            status, _, body = srv.request(
+                "/api/analyses", "POST",
+                {"score_id": score_id, "species": 2, "cantus": "P2"})
+            self.assertEqual(status, 201, body)
+            analysis = json.loads(body)
+            self.assertEqual(analysis["cantus_role"], "lower")
+            self.assertEqual(analysis["summary"]["total"], 0)
 
     def test_broken_score_returns_parse_error(self):
         with ServerHarness() as srv:
@@ -170,7 +232,8 @@ class TestHTTPApi(unittest.TestCase):
                 raw=read_sample("broken_notation.musicxml"),
                 ctype="application/xml")[2])["id"]
             status, _, body = srv.request("/api/analyses", "POST",
-                                          {"score_id": score_id})
+                                          {"score_id": score_id, "species": 1,
+                                           "cantus": "lower"})
             analysis = json.loads(body)
             self.assertEqual(analysis["status"], "parse_error")
             codes = {i["code"] for i in analysis["parse_issues"]}
