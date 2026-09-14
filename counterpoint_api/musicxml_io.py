@@ -13,6 +13,19 @@
 * 出现任何 ``error`` 时调用方必须中止分析；``warning``（如延音未配对、
   未知 type 字符串）不阻塞分析。
 
+音高还原
+--------
+每个音符同时保留两套信息，**等音高但拼写不同的音符绝不合并**：
+
+* **记谱拼写**：``step`` / ``alter``（谱面写出的变音，未写为 0）与
+  ``alter_explicit``（是否显式书写）；
+* **实际音高** ``sounding_alter`` / ``midi``：按优先级 显式 ``<alter>``
+  （含还原记号 0）→ 本小节同音名已出现的变音 → 调号隐含变音 → 自然音
+  计算，并记录来源 ``accidental_state``（``explicit`` / ``explicit_natural``
+  / ``measure_accidental`` / ``key_signature`` / ``natural``）；
+* **时点调号**：每个事件记录生效中的调号 ``key``（调号中途变化按所在
+  时点处理）。
+
 支持范围：``score-partwise``、两声部（两个 ``<part>``）、每声部单 ``<voice>``。
 不支持 ``score-timewise``、和弦、单声部内多 voice、装饰音、未指定音高记谱。
 """
@@ -23,6 +36,19 @@ import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
 _STEP_TO_SEMI = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+#: 调号五度循环：升号顺序与降号顺序影响的音名字母
+_SHARP_STEPS = ("F", "C", "G", "D", "A", "E", "B")
+_FLAT_STEPS = ("B", "E", "A", "D", "G", "C", "F")
+
+
+def key_step_alter(step: str, fifths: Optional[int]) -> int:
+    """调号对某音名字母的隐含变音：升号 +1、降号 -1、不受影响 0。"""
+    if not fifths:
+        return 0
+    if fifths > 0:
+        return 1 if step in _SHARP_STEPS[:min(fifths, 7)] else 0
+    return -1 if step in _FLAT_STEPS[:min(-fifths, 7)] else 0
 
 
 class ParseAborted(Exception):
@@ -71,6 +97,40 @@ def _int(element: ET.Element, name: str) -> Optional[int]:
 
 def _pitch_midi(pitch: Dict[str, Any]) -> int:
     return (pitch["octave"] + 1) * 12 + _STEP_TO_SEMI[pitch["step"]] + pitch.get("alter", 0)
+
+
+def _apply_accidental_state(pitch: Dict[str, Any], explicit_alter: Optional[int],
+                            key: Optional[Dict[str, Any]],
+                            accidentals: Dict[Tuple[str, int], int]) -> None:
+    """按调号与小节变音表计算实际音高，原地写入 sounding_alter / midi。
+
+    优先级：显式 ``<alter>``（含还原记号 0，写入小节变音表）>
+    本小节同音名同八度已出现的变音 > 调号隐含变音 > 自然音。
+    记谱拼写（step/alter）保持不变——等音高但拼写不同的音符不合并。
+    """
+    step, octave = pitch["step"], pitch["octave"]
+    key_fifths = key.get("fifths") if key else None
+    key_alter = key_step_alter(step, key_fifths)
+    carried = accidentals.get((step, octave))
+    if explicit_alter is not None:
+        sounding = explicit_alter
+        if explicit_alter == 0 and (key_alter != 0 or bool(carried)):
+            state = "explicit_natural"  # 还原记号：取消调号或本小节变音
+        else:
+            state = "explicit"
+        accidentals[(step, octave)] = explicit_alter
+    elif carried is not None:
+        sounding = carried
+        state = "measure_accidental"
+    elif key_alter != 0:
+        sounding = key_alter
+        state = "key_signature"
+    else:
+        sounding = 0
+        state = "natural"
+    pitch["sounding_alter"] = sounding
+    pitch["accidental_state"] = state
+    pitch["midi"] = (octave + 1) * 12 + _STEP_TO_SEMI[step] + sounding
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +358,8 @@ def _parse_part(pid: str, part_el: ET.Element) -> Dict[str, Any]:
         cursor = 0.0  # 本小节内偏移，四分音符单位
         note_index = 0
         seen_note_in_measure = False
+        # 小节变音表：显式变音（含还原记号）对同音名同八度后续音符有效，跨小节重置
+        measure_accidentals: Dict[Tuple[str, int], int] = {}
         measure_info: Dict[str, Any] = {
             "number": number, "index": m_idx,
             "time_sig": None, "beats": None, "beat_type": None, "key": None,
@@ -362,7 +424,8 @@ def _parse_part(pid: str, part_el: ET.Element) -> Dict[str, Any]:
                 ev, advance = _parse_note(el, pid, number, m_idx, note_index,
                                           order_counter, cursor, divisions,
                                           current_time, current_key, issues,
-                                          suppress_missing_divisions=missing_divisions_reported)
+                                          suppress_missing_divisions=missing_divisions_reported,
+                                          accidentals=measure_accidentals)
                 if ev is not None:
                     events.append(ev)
                     if not ev["chord"]:
@@ -461,10 +524,13 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
                 divisions: Optional[int], time_sig: Optional[Dict[str, Any]],
                 key: Optional[Dict[str, Any]],
                 issues: List[Dict[str, Any]],
-                suppress_missing_divisions: bool = False
+                suppress_missing_divisions: bool = False,
+                accidentals: Optional[Dict[Tuple[str, int], int]] = None
                 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """解析单个 <note>。返回 (事件或None, 时间推进或None)。"""
     loc = {"part_id": pid, "measure": number, "note_index": note_index}
+    if accidentals is None:
+        accidentals = {}
 
     # ---- 无法识别/不支持的记谱形式 ------------------------------------
     if _child(el, "grace") is not None:
@@ -520,12 +586,8 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
                                  pid, number, note_index))
         else:
             pitch = {"step": step, "alter": alter or 0, "octave": octave}
-            pitch["midi"] = _pitch_midi(pitch)
-            if alter is None:
-                # 调号决定的变音不写 alter 是正常的，这里只标注，不报警
-                pitch["alter_explicit"] = False
-            else:
-                pitch["alter_explicit"] = True
+            pitch["alter_explicit"] = alter is not None
+            _apply_accidental_state(pitch, alter, key, accidentals)
 
     # ---- 时值 ---------------------------------------------------------
     type_el = _child(el, "type")
@@ -626,6 +688,7 @@ def _parse_note(el: ET.Element, pid: str, number: int, m_idx: int,
         "tie_stop": tie_stop,
         "voice": voice_id,
         "chord": is_chord,
+        "key": dict(key) if key else None,
         "_order": order,
     }
     ev.update(loc)
